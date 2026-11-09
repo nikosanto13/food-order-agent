@@ -33,6 +33,8 @@ python main.py                # chat, submitting to MCP_URL from .env
 Useful flags: `--verbose` (stream JSON logs to stderr), `--force-failure kitchen_busy|server_error`
 (failure drills via `X-Demo-Force-Failure`), `--busy-rate 0.3` (mock's random busy rate).
 REPL commands: `/cart`, `/reset`, `/trace` (path of this conversation's trace), `/quit`.
+On exit, a dim summary shows the session's estimated cost by source (LLM, and in voice mode
+speech-to-text and text-to-speech).
 
 ### Voice mode (optional)
 
@@ -55,7 +57,8 @@ Ctrl+C to quit    agent   ▃▅▆▆▅▃▁▂▄▆▆▆▄▁▂▄▆▆
 Pause for about a second to end your turn. The microphone is off while the agent speaks, so
 it never hears itself, but headphones still work best. Ctrl+C while the agent speaks stops the
 audio; Ctrl+C while listening quits. Without the extra, everything else installs and runs as
-before; `--voice` just tells you what to install. See
+before; `--voice` just tells you what to install. Each turn's trace record gets a `voice` section with a latency breakdown
+(end of speech, STT, agent, time to first audio) and the estimated speech cost. See
 [design notes](docs/ARCHITECTURE.md#11-voice-an-optional-front-end).
 
 ### Programmatic API

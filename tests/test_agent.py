@@ -1,6 +1,7 @@
 """Agent-loop tests with a scripted LLM (deterministic, offline, free)."""
 
 import json
+from dataclasses import dataclass
 
 import pytest
 
@@ -482,3 +483,91 @@ def test_guard_stays_silent_for_single_unit_changes(settings):
     )
     agent.send("fries")
     assert agent.send("make it large") == {"message": "Made them large."}
+
+
+# ------------------------------------------------------------------ trace sections (voice)
+
+
+@dataclass
+class Section:
+    cost_usd: float | None
+    name: str = "voice"
+
+    def cost_breakdown(self):
+        return {"stt": None if self.cost_usd is None else self.cost_usd / 2, "tts": 0.001}
+
+    def to_record(self):
+        return {"latency_ms": {"total": 1234.0}, "cost_usd": self.cost_usd}
+
+
+def _trace_records(settings, agent):
+    path = settings.log_dir / "conversations" / f"{agent.conversation_id}.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_an_open_turn_is_written_once_closed_with_its_sections(settings):
+    agent, llm = make_agent(settings, [say("Hi! What can I get you?")])
+    llm.model = "mistral-small-latest"  # a priced model, so the LLM cost is a number
+    agent.send("hello", keep_turn_open=True)
+    assert _trace_records(settings, agent) == []  # held while the reply is spoken
+
+    agent.close_turn(Section(cost_usd=0.002))
+    (record,) = _trace_records(settings, agent)
+    assert record["voice"] == {"latency_ms": {"total": 1234.0}, "cost_usd": 0.002}
+    usage = record["usage"]
+    assert usage["voice_cost_usd"] == 0.002
+    assert usage["cost_usd"] == pytest.approx(usage["llm_cost_usd"] + 0.002)
+
+    agent.close_turn(Section(cost_usd=1.0))  # already written: no-op
+    assert len(_trace_records(settings, agent)) == 1
+
+
+def test_an_unpriced_section_makes_the_turn_total_unknown(settings):
+    agent, llm = make_agent(settings, [say("Hi!")])
+    llm.model = "mistral-small-latest"
+    agent.send("hello", keep_turn_open=True)
+    agent.close_turn(Section(cost_usd=None))
+    (record,) = _trace_records(settings, agent)
+    assert record["usage"]["voice_cost_usd"] is None
+    assert record["usage"]["cost_usd"] is None
+    assert record["usage"]["llm_cost_usd"] is not None
+
+
+def test_a_turn_left_open_is_written_by_the_next_send(settings):
+    agent, llm = make_agent(settings, [say("Hi!"), say("Sure.")])
+    llm.model = "mistral-small-latest"
+    agent.send("hello", keep_turn_open=True)
+    agent.send("a burger")  # default: written immediately
+    records = _trace_records(settings, agent)
+    assert [r["turn"] for r in records] == [1, 2]
+    assert all("voice" not in r for r in records)
+    assert all(r["usage"]["cost_usd"] == r["usage"]["llm_cost_usd"] for r in records)
+
+
+def test_session_usage_adds_up_every_turn_across_resets(settings):
+    agent, llm = make_agent(settings, [say("Hi!"), say("Sure."), say("Hello again.")])
+    llm.model = "mistral-small-latest"
+    agent.send("hello", keep_turn_open=True)
+    agent.close_turn(Section(cost_usd=0.002))  # stt 0.001 + tts 0.001
+    agent.send("a burger")
+    agent.reset()
+    agent.send("hi")
+
+    usage = agent.usage
+    assert usage.turns == 3
+    assert usage.llm_calls == 3
+    assert usage.prompt_tokens == 300
+    costs = usage.costs
+    assert list(costs) == ["llm", "voice stt", "voice tts"]
+    assert costs["voice stt"] == pytest.approx(0.001)
+    assert costs["voice tts"] == pytest.approx(0.001)
+    llm_cost = costs["llm"]
+    assert llm_cost is not None
+    assert usage.total_cost_usd == pytest.approx(llm_cost + 0.002)
+
+
+def test_an_unpriced_source_makes_the_session_total_unknown(settings):
+    agent, _ = make_agent(settings, [say("Hi!")])  # the scripted model has no price
+    agent.send("hello")
+    assert agent.usage.costs == {"llm": None}
+    assert agent.usage.total_cost_usd is None

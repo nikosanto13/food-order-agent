@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 import structlog
 
-log = structlog.get_logger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class LLMError(RuntimeError):

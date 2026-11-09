@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from food_agent.voice.audio import SAMPLE_WIDTH, SILENCE_DB, Audio, loudness, rms_dbfs
 
@@ -39,6 +40,23 @@ class VadConfig:
     min_voiced_ms: int = 250
     max_utterance_s: float = 30.0
     noise_window_s: float = 3.0
+
+
+@dataclass(frozen=True)
+class Utterance:
+    """One customer turn, with what the latency trace needs to know about its end."""
+
+    audio: Audio
+    # Silence waited for after the last voiced frame before the turn was ended. This is
+    # part of the response time the customer feels, before any network call starts.
+    end_of_speech_wait_ms: int
+    truncated: bool = False  # cut at max_utterance_s rather than ended by a pause
+    detected_at: float = 0.0  # time.monotonic() when the turn was handed over
+
+    @property
+    def speech_ended_at(self) -> float:
+        """When the customer actually stopped talking (monotonic)."""
+        return self.detected_at - self.end_of_speech_wait_ms / 1000
 
 
 class Endpointer:
@@ -79,7 +97,7 @@ class Endpointer:
         self._utterance = []
         self._pre_roll.clear()
 
-    def feed(self, frame: bytes) -> Audio | None:
+    def feed(self, frame: bytes) -> Utterance | None:
         """Process one frame; return the utterance when a turn has just ended."""
         cfg = self.config
         db = rms_dbfs(frame)
@@ -112,11 +130,17 @@ class Endpointer:
 
         # Turn over. Keep a short tail of the trailing silence, drop the rest.
         keep = len(self._utterance) - max(0, self._silence - self._start_frames)
-        utterance, voiced_frames = self._utterance[:keep], self._voiced
+        frames, voiced_frames = self._utterance[:keep], self._voiced
+        wait_ms = self._silence * cfg.frame_ms
+        truncated = self._silence < self._end_frames
         self.reset()
         if voiced_frames < self._min_voiced_frames:
             return None  # a bump or a cough, not a turn
-        return Audio(b"".join(utterance), self.sample_rate)
+        return Utterance(
+            audio=Audio(b"".join(frames), self.sample_rate),
+            end_of_speech_wait_ms=wait_ms,
+            truncated=truncated,
+        )
 
 
 class Listener:
@@ -130,12 +154,16 @@ class Listener:
     """
 
     def __init__(
-        self, endpointer: Endpointer, on_level: Callable[[float], None] | None = None
+        self,
+        endpointer: Endpointer,
+        on_level: Callable[[float], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._endpointer = endpointer
         self._on_level = on_level
+        self._clock = clock
         self._lock = threading.Lock()
-        self._utterances: queue.Queue[Audio] = queue.Queue()
+        self._utterances: queue.Queue[Utterance] = queue.Queue()
         self._active = False
         self._skip_frames = 0
         self._buffer = b""
@@ -158,7 +186,7 @@ class Listener:
         with self._lock:
             self._active = False
 
-    def next_utterance(self, timeout: float) -> Audio | None:
+    def next_utterance(self, timeout: float) -> Utterance | None:
         try:
             return self._utterances.get(timeout=timeout)
         except queue.Empty:
@@ -182,5 +210,5 @@ class Listener:
                 if utterance is not None:
                     self._active = False  # one utterance per turn
                     self._buffer = b""
-                    self._utterances.put(utterance)
+                    self._utterances.put(replace(utterance, detected_at=self._clock()))
                     return

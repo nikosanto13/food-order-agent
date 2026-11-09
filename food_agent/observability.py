@@ -9,7 +9,8 @@ Two complementary outputs:
 * **Conversation trace** (``logs/conversations/<id>.jsonl``): exactly one record
   per turn with the user/assistant text, every step (LLM calls with latency and
   tokens, tool calls with arguments and results), the cart after the turn, the
-  phase, and token/cost totals. This is the artefact you open to debug or eval a
+  phase, and token/cost totals (plus sections a front-end attaches, e.g. ``voice``
+  timings and speech cost). This is the artefact you open to debug or eval a
   conversation, and it maps 1:1 onto an OpenTelemetry trace (turn = root span,
   steps = child spans) if this ever moves to Langfuse/Phoenix/OTel.
 """
@@ -25,7 +26,7 @@ from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Protocol, TextIO
 
 import structlog
 
@@ -86,6 +87,84 @@ def new_conversation_id() -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+class TraceSection(Protocol):
+    """Extra data a front-end attaches to a turn record, e.g. the ``voice`` section.
+
+    ``cost_usd`` is added to the turn's total; ``None`` means "could not be priced",
+    which makes the total ``None`` too rather than silently under-reporting.
+    """
+
+    name: str
+
+    @property
+    def cost_usd(self) -> float | None: ...
+
+    def cost_breakdown(self) -> dict[str, float | None]:
+        """``cost_usd`` split by part (e.g. ``{"stt": ..., "tts": ...}``), for summaries."""
+        ...
+
+    def to_record(self) -> dict[str, Any]: ...
+
+
+def merge_sections(record: dict[str, Any], sections: tuple[TraceSection, ...]) -> None:
+    """Add each section under its name, with its cost in ``usage`` and in the total."""
+    usage = record["usage"]
+    total = usage["cost_usd"]
+    for section in sections:
+        record[section.name] = section.to_record()
+        cost = section.cost_usd
+        usage[f"{section.name}_cost_usd"] = None if cost is None else round(cost, 6)
+        total = None if total is None or cost is None else round(total + cost, 6)
+    usage["cost_usd"] = total
+
+
+@dataclass
+class SessionUsage:
+    """Running totals over every turn of a session (across conversation resets).
+
+    Costs are kept per source: ``llm``, and ``<section> <part>`` for front-end sections
+    (``voice stt``, ``voice tts``). A source that was ever unpriced reports ``None``, and
+    so does the total: a partial sum would under-report.
+    """
+
+    turns: int = 0
+    llm_calls: int = 0
+    prompt_tokens: int = 0
+    cached_prompt_tokens: int = 0
+    completion_tokens: int = 0
+    _costs: dict[str, float] = field(default_factory=dict)
+    _unpriced: set[str] = field(default_factory=set)
+
+    def add(self, usage: Mapping[str, Any], sections: tuple[TraceSection, ...] = ()) -> None:
+        self.turns += 1
+        self.llm_calls += usage["llm_calls"]
+        self.prompt_tokens += usage["prompt_tokens"]
+        self.cached_prompt_tokens += usage["cached_prompt_tokens"]
+        self.completion_tokens += usage["completion_tokens"]
+        self._add_cost("llm", usage["llm_cost_usd"])
+        for section in sections:
+            for part, cost in section.cost_breakdown().items():
+                self._add_cost(f"{section.name} {part}", cost)
+
+    def _add_cost(self, source: str, cost: float | None) -> None:
+        self._costs.setdefault(source, 0.0)
+        if cost is None:
+            self._unpriced.add(source)
+        else:
+            self._costs[source] += cost
+
+    @property
+    def costs(self) -> dict[str, float | None]:
+        """Cost per source, in first-seen order (``llm`` first)."""
+        return {s: None if s in self._unpriced else round(c, 6) for s, c in self._costs.items()}
+
+    @property
+    def total_cost_usd(self) -> float | None:
+        if self._unpriced:
+            return None
+        return round(sum(self._costs.values()), 6)
 
 
 @dataclass
@@ -155,7 +234,8 @@ class TurnTrace:
                 "prompt_tokens": self.prompt_tokens,
                 "cached_prompt_tokens": self.cached_prompt_tokens,
                 "completion_tokens": self.completion_tokens,
-                "cost_usd": self.total_cost_usd,
+                "llm_cost_usd": self.total_cost_usd,
+                "cost_usd": self.total_cost_usd,  # all priced work in the turn (+ sections)
                 "llm_calls": sum(1 for s in self.steps if s["type"] == "llm"),
             },
             "errors": self.errors,

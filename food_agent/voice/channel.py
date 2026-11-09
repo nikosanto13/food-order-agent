@@ -24,6 +24,7 @@ import structlog
 
 from food_agent.config import Settings
 from food_agent.menu import Menu
+from food_agent.pricing import STT_PRICING, TTS_PRICING, estimate_stt_cost, estimate_tts_cost
 from food_agent.voice.audio import Audio
 from food_agent.voice.devices import MIC_SAMPLE_RATE, Microphone, Speaker
 from food_agent.voice.display import RichDisplay, Role, Status
@@ -31,19 +32,27 @@ from food_agent.voice.eleven import ElevenLabsSpeech, menu_keyterms
 from food_agent.voice.errors import SpeechError, VoiceUnavailableError
 from food_agent.voice.meter import Lane
 from food_agent.voice.speakable import to_speech
-from food_agent.voice.vad import Endpointer, Listener, VadConfig
+from food_agent.voice.trace import SttAttempt, SttOutcome, TtsOutcome, TtsResult, VoiceTurnTrace
+from food_agent.voice.vad import Endpointer, Listener, Utterance, VadConfig
 
-log = structlog.get_logger(__name__)
+logger = structlog.get_logger(__name__)
 
 ECHO_GUARD_MS = 300  # after the agent speaks, ignore the room's echo of it
 POLL_S = 0.05
 
 
 class SpeechToText(Protocol):
+    stt_model: str
+
+    @property
+    def keyterms(self) -> Sequence[str]: ...
+
     def transcribe(self, audio: Audio) -> str: ...
 
 
 class TextToSpeech(Protocol):
+    tts_model: str
+    voice_id: str
     sample_rate: int
 
     def synthesize(self, text: str) -> Iterable[bytes]: ...
@@ -54,7 +63,7 @@ class TurnListener(Protocol):
     def in_speech(self) -> bool: ...
     def listen(self, ignore_ms: int = 0) -> None: ...
     def pause(self) -> None: ...
-    def next_utterance(self, timeout: float) -> Audio | None: ...
+    def next_utterance(self, timeout: float) -> Utterance | None: ...
 
 
 class Player(Protocol):
@@ -83,6 +92,7 @@ class HandsFreeChannel:
         display: Display,
         resources: Sequence[AbstractContextManager[object]] = (),
         echo_guard_ms: int = ECHO_GUARD_MS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._stt = stt
         self._tts = tts
@@ -93,6 +103,8 @@ class HandsFreeChannel:
         self._echo_guard_ms = echo_guard_ms
         self._just_spoke = False
         self._stack = contextlib.ExitStack()
+        self._clock = clock
+        self._trace: VoiceTurnTrace | None = None
 
     def __enter__(self) -> Self:
         with contextlib.ExitStack() as stack:
@@ -107,19 +119,29 @@ class HandsFreeChannel:
 
     def read(self) -> str:
         """Block until the customer has said something; return the transcript."""
+        trace = self._new_trace()
         while True:
             self._listener.listen(ignore_ms=self._echo_guard_ms if self._just_spoke else 0)
             self._just_spoke = False
-            audio = self._wait_for_utterance()
+            utterance = self._wait_for_utterance()
             self._display.set_status("transcribing")
-            text = self._transcribe(audio)
+            text = self._transcribe(utterance, trace)
             if text:
+                trace.speech_ended_at = utterance.speech_ended_at
+                trace.transcribed_at = self._clock()
                 self._display.say("you", text)
                 self._display.set_status("thinking")
                 return text
 
+    def trace_sections(self) -> tuple[VoiceTurnTrace, ...]:
+        """The ``voice`` section for the turn just completed (once per turn)."""
+        trace, self._trace = self._trace, None
+        return () if trace is None else (trace,)
+
     def reply(self, message: str) -> None:
         """Show the reply and speak it. Ctrl+C stops the audio, not the session."""
+        trace = self._trace or self._new_trace()
+        trace.reply_started_at = self._clock()
         self._listener.pause()
         self._display.say("agent", message)
         spoken = to_speech(message)
@@ -127,15 +149,16 @@ class HandsFreeChannel:
             return
         self._display.set_status("speaking")
         self._just_spoke = True
-        started = time.monotonic()
-        first_audio: list[float] = []
 
         def timed(chunks: Iterable[bytes]) -> Iterator[bytes]:
             for chunk in chunks:
-                if not first_audio:
-                    first_audio.append(time.monotonic())
+                if trace.first_audio_at is None:
+                    trace.first_audio_at = self._clock()
                 yield chunk
 
+        trace.tts_requested_at = started = self._clock()
+        outcome: TtsOutcome = "ok"
+        error: str | None = None
         try:
             self._player.play(
                 timed(self._tts.synthesize(spoken)),
@@ -143,43 +166,84 @@ class HandsFreeChannel:
                 on_level=lambda level: self._display.level("agent", level),
             )
         except SpeechError as exc:
-            log.warning("voice.tts_failed", error=str(exc))
+            outcome, error = "error", str(exc)
+            logger.warning("voice.tts_failed", error=error)
             self._display.say("note", "(Couldn't play the audio; the reply is shown above.)")
-            return
         except KeyboardInterrupt:
-            log.info("voice.tts_interrupted")
+            outcome = "interrupted"
+            logger.info("voice.tts_interrupted")
             self._display.say("note", "(stopped)")
-            return
-        log.info(
-            "voice.tts",
-            chars=len(spoken),
-            first_audio_ms=round((first_audio[0] - started) * 1000) if first_audio else None,
-            total_ms=round((time.monotonic() - started) * 1000),
+        first_audio_ms = (
+            None
+            if trace.first_audio_at is None
+            else round((trace.first_audio_at - started) * 1000, 1)
         )
+        # Billed per character requested; a request that produced no audio is assumed free.
+        cost = (
+            estimate_tts_cost(self._tts.tts_model, chars=len(spoken))
+            if trace.first_audio_at is not None
+            else 0.0
+        )
+        trace.tts = TtsResult(
+            chars=len(spoken),
+            first_audio_ms=first_audio_ms,
+            total_ms=round((self._clock() - started) * 1000, 1),
+            cost_usd=cost,
+            outcome=outcome,
+            error=error,
+        )
+        logger.info("voice.tts", **trace.tts.to_record())
 
-    def _wait_for_utterance(self) -> Audio:
+    def _new_trace(self) -> VoiceTurnTrace:
+        self._trace = VoiceTurnTrace(
+            stt_model=self._stt.stt_model,
+            keyterms=len(self._stt.keyterms),
+            tts_model=self._tts.tts_model,
+            voice_id=self._tts.voice_id,
+        )
+        return self._trace
+
+    def _wait_for_utterance(self) -> Utterance:
         # Short polls keep Ctrl+C responsive and the status line current.
         while True:
             self._display.set_status("hearing" if self._listener.in_speech else "listening")
-            audio = self._listener.next_utterance(timeout=POLL_S)
-            if audio is not None:
-                return audio
+            utterance = self._listener.next_utterance(timeout=POLL_S)
+            if utterance is not None:
+                return utterance
 
-    def _transcribe(self, audio: Audio) -> str:
-        started = time.monotonic()
+    def _transcribe(self, utterance: Utterance, trace: VoiceTurnTrace) -> str:
+        audio = utterance.audio
+        started = self._clock()
+        outcome: SttOutcome = "ok"
+        error: str | None = None
         try:
             text = self._stt.transcribe(audio)
         except SpeechError as exc:
-            log.warning("voice.stt_failed", audio_s=round(audio.duration_s, 2), error=str(exc))
+            text, outcome, error = "", "error", str(exc)
             self._display.say("note", "Sorry, I couldn't transcribe that. Please say it again.")
-            return ""
-        log.info(
-            "voice.stt",
-            audio_s=round(audio.duration_s, 2),
-            latency_ms=round((time.monotonic() - started) * 1000),
+        else:
+            if not text:
+                outcome = "empty"  # background noise, not words: keep listening quietly
+        attempt = SttAttempt(
+            audio_s=audio.duration_s,
+            end_of_speech_wait_ms=utterance.end_of_speech_wait_ms,
+            truncated=utterance.truncated,
+            latency_ms=round((self._clock() - started) * 1000, 1),
             chars=len(text),
+            # A failed request is assumed not to be billed.
+            cost_usd=0.0
+            if outcome == "error"
+            else estimate_stt_cost(
+                self._stt.stt_model,
+                audio_s=audio.duration_s,
+                keyterms=bool(self._stt.keyterms),
+            ),
+            outcome=outcome,
+            error=error,
         )
-        return text  # empty: background noise, not words; keep listening quietly
+        trace.attempts.append(attempt)
+        logger.log(30 if error else 20, "voice.stt", **attempt.to_record())
+        return text
 
 
 def build_voice_channel(settings: Settings, menu: Menu) -> HandsFreeChannel:
@@ -192,6 +256,10 @@ def build_voice_channel(settings: Settings, menu: Menu) -> HandsFreeChannel:
         end_silence_ms=settings.voice_end_silence_ms,
         max_utterance_s=settings.voice_max_utterance_s,
     )
+    if settings.elevenlabs_stt_model not in STT_PRICING:
+        logger.warning("voice.pricing_missing", model=settings.elevenlabs_stt_model)
+    if settings.elevenlabs_tts_model not in TTS_PRICING:
+        logger.warning("voice.pricing_missing", model=settings.elevenlabs_tts_model)
     endpointer = Endpointer(vad, sample_rate=MIC_SAMPLE_RATE)
     display = RichDisplay()
     listener = Listener(endpointer, on_level=lambda level: display.level("you", level))

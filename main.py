@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import sys
 from typing import Protocol, Self
 
 from food_agent.agent import FoodOrderAgent
 from food_agent.config import Settings
 from food_agent.local_server import BackgroundMockServer
 from food_agent.menu import Menu
-from food_agent.observability import configure_logging
+from food_agent.observability import SessionUsage, TraceSection, configure_logging
 
 HELP = "Commands: /cart  /reset  /trace  /help  /quit"
 
@@ -48,6 +49,9 @@ class Channel(Protocol):
     def __exit__(self, *exc: object) -> None: ...
     def read(self) -> str: ...
     def reply(self, message: str) -> None: ...
+    def trace_sections(self) -> tuple[TraceSection, ...]:
+        """What this channel adds to the turn's trace record (and cost)."""
+        ...
 
 
 class TextChannel:
@@ -62,6 +66,9 @@ class TextChannel:
 
     def reply(self, message: str) -> None:
         print(f"Agent: {message}")
+
+    def trace_sections(self) -> tuple[TraceSection, ...]:
+        return ()
 
 
 def _open_voice_channel(settings: Settings, menu: Menu, stack: contextlib.ExitStack) -> Channel:
@@ -102,12 +109,41 @@ def _repl(agent: FoodOrderAgent, channel: Channel) -> None:
             print(agent.settings.log_dir / "conversations" / f"{agent.conversation_id}.jsonl")
             continue
 
-        response = agent.send(user)
-        channel.reply(response["message"])
-        for call in response.get("tool_calls", []):
-            result = json.dumps(call["result"], ensure_ascii=False)
-            print(f"  [{call['name']} -> {result}]")
-        print()
+        # The turn stays open while the reply is delivered, so the channel's own
+        # timings and cost (e.g. speech) land in the same trace record.
+        response = agent.send(user, keep_turn_open=True)
+        try:
+            channel.reply(response["message"])
+            for call in response.get("tool_calls", []):
+                result = json.dumps(call["result"], ensure_ascii=False)
+                print(f"  [{call['name']} -> {result}]")
+            print()
+        finally:
+            agent.close_turn(*channel.trace_sections())
+
+
+def _dim(text: str) -> str:
+    return f"\x1b[2m{text}\x1b[0m" if sys.stdout.isatty() else text
+
+
+def _usd(cost: float | None) -> str:
+    return "n/a (unpriced model)" if cost is None else f"${cost:.6f}"
+
+
+def session_cost_summary(usage: SessionUsage) -> str:
+    """Estimated USD spend of the session, by source (LLM, speech-to-text, text-to-speech)."""
+    turns = f"{usage.turns} turn{'' if usage.turns == 1 else 's'}"
+    lines = [f"Session cost (estimated, USD) over {turns}:"]
+    details = {
+        "llm": (
+            f"{usage.llm_calls} calls, {usage.prompt_tokens:,} in "
+            f"({usage.cached_prompt_tokens:,} cached) / {usage.completion_tokens:,} out tokens"
+        )
+    }
+    for source, cost in usage.costs.items():
+        lines.append(f"  {source:<10} {_usd(cost):>12}  {details.get(source, '')}".rstrip())
+    lines.append(f"  {'total':<10} {_usd(usage.total_cost_usd):>12}")
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -126,18 +162,28 @@ def main() -> None:
         level=base.log_level, log_dir=base.log_dir, to_stderr=args.verbose or base.log_to_stderr
     )
 
-    with contextlib.ExitStack() as stack:
-        if args.local:
-            server = stack.enter_context(BackgroundMockServer(busy_rate=args.busy_rate))
-            overrides["mcp_url"] = server.url
-            overrides.setdefault("applicant_email", "local@example.com")
-        settings = base.model_copy(update=overrides)
-        agent = FoodOrderAgent(settings=settings)
-        if args.voice:
-            channel = _open_voice_channel(settings, agent.menu, stack)
-        else:
-            channel = stack.enter_context(TextChannel())
-        _repl(agent, channel)
+    agent: FoodOrderAgent | None = None
+    try:
+        with contextlib.ExitStack() as stack:
+            if args.local:
+                server = stack.enter_context(BackgroundMockServer(busy_rate=args.busy_rate))
+                overrides["mcp_url"] = server.url
+                overrides.setdefault("applicant_email", "local@example.com")
+            settings = base.model_copy(update=overrides)
+            agent = FoodOrderAgent(settings=settings)
+            if args.voice:
+                channel = _open_voice_channel(settings, agent.menu, stack)
+            else:
+                channel = stack.enter_context(TextChannel())
+            _repl(agent, channel)
+    except KeyboardInterrupt:
+        print()  # Ctrl+C outside the prompt (e.g. mid-reply): still show the summary
+    finally:
+        # After the stack has closed, so the voice display is gone and this stays on screen.
+        if agent is not None:
+            agent.close_turn()
+            if agent.usage.turns:
+                print(_dim(session_cost_summary(agent.usage)))
 
 
 if __name__ == "__main__":

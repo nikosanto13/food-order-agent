@@ -31,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from food_agent.cart import MAX_LINE_QUANTITY, OrderError, OrderSession, describe_line
 from food_agent.mcp_client import OrderSubmitter, SubmitOutcome
 
-log = structlog.get_logger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 # --------------------------------------------------------------------------- argument models
@@ -175,9 +175,6 @@ _SUBMIT_GUIDANCE: dict[SubmitOutcome, str] = {
         "Tell the customer honestly; do not resubmit unless they explicitly ask."
     ),
 }
-
-
-# --------------------------------------------------------------------------- execution
 
 
 @dataclass
@@ -341,7 +338,7 @@ class ToolExecutor:
         payload = self._session.authorize_submission(turn)  # raises if guard not satisfied
         started = time.perf_counter()
         res = self._submitter.submit(payload)
-        log.info(
+        logger.info(
             "order.submit",
             outcome=res.outcome.value,
             attempts=res.attempts,

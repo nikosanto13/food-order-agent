@@ -28,20 +28,21 @@ from food_agent.mcp_client import McpOrderSubmitter, OrderSubmitter
 from food_agent.menu import Menu, load_menu
 from food_agent.observability import (
     ConversationTraceWriter,
+    SessionUsage,
+    TraceSection,
     TurnTrace,
     configure_logging,
+    merge_sections,
     new_conversation_id,
 )
 from food_agent.pricing import estimate_cost, pricing_for
 from food_agent.prompts import build_static_prompt, build_system_message
 from food_agent.tools import TOOL_SCHEMAS, ToolExecutor
 
-log = structlog.get_logger(__name__)
+logger = structlog.get_logger(__name__)
 
 EMPTY_INPUT_REPLY = "Sorry, I didn't catch that. What would you like to order?"
-LLM_DOWN_REPLY = (
-    "Sorry, I'm having trouble right now. Your order is saved; please try again in a moment."
-)
+LLM_DOWN_REPLY = "Sorry, I'm having trouble right now. Your order is saved; please try again in a moment."
 STUCK_REPLY = "Sorry, I got a bit confused there. Here's your order so far:\n{summary}"
 
 
@@ -71,7 +72,9 @@ class FoodOrderAgent:
         self.menu = menu or load_menu()
         self.llm = llm or self._default_llm()
         if pricing_for(self.llm.model) is None:
-            log.warning("llm.pricing_missing", model=self.llm.model, detail="cost_usd will be null")
+            logger.warning(
+                "llm.pricing_missing", model=self.llm.model, detail="cost_usd will be null"
+            )
         self.submitter = submitter or McpOrderSubmitter(
             self.settings.mcp_url,
             applicant_email=self.settings.applicant_email,
@@ -81,6 +84,9 @@ class FoodOrderAgent:
         )
         self._static_prompt = build_static_prompt(self.menu, self.settings.reply_style)
         self._traces = ConversationTraceWriter(self.settings.log_dir)
+        self._open_record: dict[str, Any] | None = None
+        self.usage = SessionUsage()  # whole session: survives reset()
+        self._keep_turn_open = False
         self.reset(conversation_id)
 
     def _default_llm(self) -> LLMClient:
@@ -97,15 +103,23 @@ class FoodOrderAgent:
 
     def reset(self, conversation_id: str | None = None) -> None:
         """Start a new conversation (fresh cart, history and conversation id)."""
+        self.close_turn()
         self.conversation_id = conversation_id or new_conversation_id()
         self.session = OrderSession(self.menu)
         self._tools = ToolExecutor(self.session, self.submitter)
         self._history: list[dict[str, Any]] = []
         self._turn = 0
 
-    # ------------------------------------------------------------------ public API
+    def send(self, message: str, *, keep_turn_open: bool = False) -> dict[str, Any]:
+        """Process one user message and return the reply (see the brief's format).
 
-    def send(self, message: str) -> dict[str, Any]:
+        The turn's trace record is written before returning, unless ``keep_turn_open``:
+        then it is held until ``close_turn()``, so a front-end can add what happens
+        around the agent (the voice channel adds transcription and speech timings and
+        cost). A turn left open is closed by the next ``send()`` or ``reset()``.
+        """
+        self.close_turn()
+        self._keep_turn_open = keep_turn_open
         self._turn += 1
         structlog.contextvars.bind_contextvars(
             conversation_id=self.conversation_id, turn=self._turn
@@ -115,12 +129,26 @@ class FoodOrderAgent:
         finally:
             structlog.contextvars.unbind_contextvars("conversation_id", "turn")
 
-    # ------------------------------------------------------------------ internals
+    def close_turn(self, *sections: TraceSection) -> None:
+        """Write the open turn's trace record, with ``sections`` merged in. No-op if none."""
+        record, self._open_record = self._open_record, None
+        if record is None:
+            return
+        self.usage.add(record["usage"], sections)
+        if sections:
+            merge_sections(record, sections)
+            logger.info(
+                "turn.closed",
+                conversation_id=record["conversation_id"],
+                turn=record["turn"],
+                **{k: v for k, v in record["usage"].items() if k.endswith("cost_usd")},
+            )
+        self._traces.write(record)
 
     def _send(self, message: str) -> dict[str, Any]:
         text = (message or "").strip()
         trace = TurnTrace(self.conversation_id, self._turn, text)
-        log.info("turn.start", chars=len(text))
+        logger.info("turn.start", chars=len(text))
 
         if not text:
             return self._finish(trace, EMPTY_INPUT_REPLY, [])
@@ -145,7 +173,7 @@ class FoodOrderAgent:
                 response = self._call_llm(trace)
             except LLMError as exc:
                 trace.errors.append(f"llm_error: {exc}")
-                log.exception("llm.failed")
+                logger.exception("llm.failed")
                 reply = LLM_DOWN_REPLY
                 break
 
@@ -181,7 +209,7 @@ class FoodOrderAgent:
                     ok=result.content.get("ok"),
                     result=result.content,
                 )
-                log.info("tool.call", tool=tc.name, ok=result.content.get("ok"))
+                logger.info("tool.call", tool=tc.name, ok=result.content.get("ok"))
                 self._history.append(
                     {
                         "role": "tool",
@@ -192,7 +220,7 @@ class FoodOrderAgent:
                 )
         else:
             trace.errors.append("max_tool_iterations")
-            log.warning("agent.max_iterations")
+            logger.warning("agent.max_iterations")
             reply = STUCK_REPLY.format(summary=self.session.cart.summary_text())
 
         assert reply is not None  # every branch above sets it  # noqa: S101
@@ -234,7 +262,7 @@ class FoodOrderAgent:
             finish_reason=response.finish_reason,
             tool_calls=[tc.name for tc in response.tool_calls],
         )
-        log.info(
+        logger.info(
             "llm.call",
             model=response.model or self.llm.model,
             latency_ms=response.latency_ms,
@@ -276,7 +304,7 @@ class FoodOrderAgent:
             summary = self.session.cart.summary_text()
             total = self.session.cart.snapshot()["total"]
             if total not in reply:
-                log.warning("reply.guard", guard="review_total_missing")
+                logger.warning("reply.guard", guard="review_total_missing")
                 reply = f"{reply}\n\n{summary}\nReady to submit?"
                 summary_shown = True
         if not summary_shown:
@@ -284,7 +312,7 @@ class FoodOrderAgent:
         if "submitted" in events:
             order_id = str(external_calls[-1]["result"].get("order_id", ""))
             if order_id and order_id not in reply:
-                log.warning("reply.guard", guard="order_id_missing")
+                logger.warning("reply.guard", guard="order_id_missing")
                 reply = f"{reply}\nOrder #{order_id}."
         return reply
 
@@ -311,7 +339,7 @@ class FoodOrderAgent:
         gone = [d for d in dict.fromkeys(removed_lines) if d.lower() not in lowered]
         if not missing and not gone:
             return reply
-        log.warning("reply.guard", guard="multi_unit_change_unstated")
+        logger.warning("reply.guard", guard="multi_unit_change_unstated")
         notes = []
         if gone:
             notes.append(f"Removed: {', '.join(gone)}.")
@@ -328,8 +356,12 @@ class FoodOrderAgent:
             cart=self.session.cart.snapshot(),
             phase=self.session.phase.value,
         )
-        self._traces.write(record)
-        log.info(
+        if self._keep_turn_open:
+            self._open_record = record
+        else:
+            self.usage.add(record["usage"])
+            self._traces.write(record)
+        logger.info(
             "turn.end",
             latency_ms=record["latency_ms"],
             phase=record["phase"],

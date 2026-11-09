@@ -6,7 +6,13 @@ from types import SimpleNamespace
 import pytest
 
 from food_agent.llm import MistralLLM
-from food_agent.pricing import MODEL_PRICING, ModelPricing, estimate_cost
+from food_agent.pricing import (
+    MODEL_PRICING,
+    ModelPricing,
+    estimate_cost,
+    estimate_stt_cost,
+    estimate_tts_cost,
+)
 
 
 def test_mistral_small_prices():
@@ -85,3 +91,24 @@ def test_real_sdk_usage_object():
         }
     )
     assert MistralLLM._cached_prompt_tokens(usage) == 64
+
+
+# ------------------------------------------------------------------ speech
+
+
+def test_stt_is_billed_per_audio_hour_with_a_keyterms_add_on():
+    assert estimate_stt_cost("scribe_v2", audio_s=3600, keyterms=False) == pytest.approx(0.22)
+    assert estimate_stt_cost("scribe_v2", audio_s=3600, keyterms=True) == pytest.approx(0.27)
+    assert estimate_stt_cost("scribe_v2", audio_s=2.5, keyterms=True) == pytest.approx(
+        2.5 * 0.27 / 3600
+    )
+
+
+def test_tts_is_billed_per_thousand_characters():
+    assert estimate_tts_cost("eleven_flash_v2_5", chars=1000) == pytest.approx(0.04)
+    assert estimate_tts_cost("eleven_flash_v2_5", chars=250) == pytest.approx(0.01)
+
+
+def test_unknown_speech_models_are_unpriced_not_free():
+    assert estimate_stt_cost("scribe_v9", audio_s=10, keyterms=False) is None
+    assert estimate_tts_cost("eleven_v9", chars=10) is None

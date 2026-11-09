@@ -27,7 +27,7 @@ from food_agent.voice.audio import SILENCE_DB, aligned_frames, loudness, rms_dbf
 from food_agent.voice.channel import build_voice_channel
 from food_agent.voice.eleven import MAX_KEYTERMS, ElevenLabsSpeech, menu_keyterms
 from food_agent.voice.meter import LevelMeter, bars
-from food_agent.voice.vad import Endpointer, Listener, VadConfig
+from food_agent.voice.vad import Endpointer, Listener, Utterance, VadConfig
 
 ONE_SECOND = Audio(b"\x00\x00" * 16_000, 16_000)
 
@@ -202,8 +202,8 @@ def hiss(ms: int, amplitude: int = 30) -> list[bytes]:
     return list(split_frames(samples.tobytes(), FRAME))
 
 
-def run(endpointer: Endpointer, frames: list[bytes]) -> list[Audio]:
-    return [a for f in frames if (a := endpointer.feed(f)) is not None]
+def run(endpointer: Endpointer, frames: list[bytes]) -> list[Utterance]:
+    return [u for f in frames if (u := endpointer.feed(f)) is not None]
 
 
 def test_levels_separate_silence_room_and_speech():
@@ -219,8 +219,11 @@ def test_speech_then_a_pause_is_one_turn_with_its_onset_kept():
     turns = run(ep, hiss(1000) + tone(1000) + hiss(1500))
     assert len(turns) == 1
     # 1 s of speech, plus pre-roll before it and a short tail after it.
-    assert 1.2 <= turns[0].duration_s <= 1.6
+    assert 1.2 <= turns[0].audio.duration_s <= 1.6
     assert not ep.in_speech
+    # The turn ended after exactly the configured pause: that wait is part of latency.
+    assert turns[0].end_of_speech_wait_ms == ep.config.end_silence_ms
+    assert not turns[0].truncated
 
 
 def test_turn_does_not_end_on_short_gaps_between_words():
@@ -228,7 +231,7 @@ def test_turn_does_not_end_on_short_gaps_between_words():
     words = tone(400) + hiss(300) + tone(400) + hiss(300) + tone(400)
     turns = run(ep, hiss(1000) + words + hiss(1500))
     assert len(turns) == 1
-    assert turns[0].duration_s > 1.8
+    assert turns[0].audio.duration_s > 1.8
 
 
 def test_clicks_and_coughs_are_not_turns():
@@ -241,7 +244,9 @@ def test_long_monologues_are_cut_at_the_limit():
     ep = Endpointer(VadConfig(max_utterance_s=2), sample_rate=RATE)
     turns = run(ep, hiss(1000) + tone(5000))
     assert turns
-    assert turns[0].duration_s == pytest.approx(2, abs=0.05)
+    assert turns[0].audio.duration_s == pytest.approx(2, abs=0.05)
+    assert turns[0].truncated
+    assert turns[0].end_of_speech_wait_ms == 0
 
 
 def test_a_steady_noise_becomes_the_new_floor():
@@ -256,7 +261,7 @@ def test_a_steady_noise_becomes_the_new_floor():
 
 def test_listener_only_hears_the_customers_turn():
     levels: list[float] = []
-    listener = Listener(Endpointer(sample_rate=RATE), on_level=levels.append)
+    listener = Listener(Endpointer(sample_rate=RATE), on_level=levels.append, clock=lambda: 100.0)
     speech = b"".join(hiss(1000) + tone(800) + hiss(1500))
 
     listener.feed(speech)  # not listening yet: e.g. the agent is speaking
@@ -268,6 +273,8 @@ def test_listener_only_hears_the_customers_turn():
         listener.feed(speech[i : i + 1234])
     turn = listener.next_utterance(timeout=0)
     assert turn is not None
+    assert turn.detected_at == 100.0
+    assert turn.speech_ended_at == pytest.approx(100.0 - 0.9)
     assert max(levels) > 0.5
     listener.feed(speech)  # one utterance per turn until listen() is called again
     assert listener.next_utterance(timeout=0) is None
@@ -320,9 +327,26 @@ def test_display_renders_status_and_both_bars():
 # ------------------------------------------------------------------ hands-free channel
 
 
+class Clock:
+    """Manual monotonic clock: fakes advance it to simulate how long things take."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def said(audio: Audio = ONE_SECOND, *, at: float = 0.0, wait_ms: int = 900) -> Utterance:
+    return Utterance(audio, end_of_speech_wait_ms=wait_ms, detected_at=at)
+
+
 @dataclass
 class FakeListener:
-    turns: list[Audio | None]
+    turns: list[Utterance | None]
     calls: list[str] = field(default_factory=list)
     in_speech: bool = False
 
@@ -332,7 +356,7 @@ class FakeListener:
     def pause(self) -> None:
         self.calls.append("pause")
 
-    def next_utterance(self, timeout: float) -> Audio | None:
+    def next_utterance(self, timeout: float) -> Utterance | None:
         self.in_speech = not self.in_speech
         return self.turns.pop(0) if self.turns else None
 
@@ -340,8 +364,14 @@ class FakeListener:
 @dataclass
 class FakeSTT:
     results: list[str | Exception]
+    clock: Clock | None = None
+    latency_s: float = 0.0
+    stt_model: str = "scribe_v2"
+    keyterms: list[str] = field(default_factory=lambda: ["Margherita"])
 
     def transcribe(self, audio: Audio) -> str:
+        if self.clock:
+            self.clock.advance(self.latency_s)
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -351,11 +381,17 @@ class FakeSTT:
 @dataclass
 class FakeTTS:
     error: Exception | None = None
+    clock: Clock | None = None
+    first_chunk_s: float = 0.0
     sample_rate: int = 22_050
+    tts_model: str = "eleven_flash_v2_5"
+    voice_id: str = "voice"
     spoken: list[str] = field(default_factory=list)
 
     def synthesize(self, text: str) -> Iterable[bytes]:
         self.spoken.append(text)
+        if self.clock:
+            self.clock.advance(self.first_chunk_s)
         yield b"\x00\x40" * 441
         if self.error:
             raise self.error
@@ -364,6 +400,8 @@ class FakeTTS:
 @dataclass
 class FakePlayer:
     error: BaseException | None = None
+    clock: Clock | None = None
+    playback_s: float = 0.0
     played: list[bytes] = field(default_factory=list)
 
     def play(self, chunks: Iterable[bytes], sample_rate: int, on_level=None) -> None:
@@ -373,6 +411,8 @@ class FakePlayer:
             self.played.append(chunk)
             if on_level:
                 on_level(loudness(chunk))
+        if self.clock:
+            self.clock.advance(self.playback_s)
 
 
 @dataclass
@@ -392,21 +432,22 @@ class FakeDisplay:
         self.lines.append((role, text))
 
 
-def make_channel(*, turns=(), stt=(), tts=None, player=None):
+def make_channel(*, turns=(), stt=(), tts=None, player=None, stt_fake=None, clock=None):
     listener, display = FakeListener(list(turns)), FakeDisplay()
     channel = HandsFreeChannel(
-        stt=FakeSTT(list(stt)),
+        stt=stt_fake or FakeSTT(list(stt)),
         tts=tts or FakeTTS(),
         listener=listener,
         player=player or FakePlayer(),
         display=display,
         echo_guard_ms=300,
+        clock=clock or Clock(),
     )
     return channel, listener, display
 
 
 def test_read_waits_for_a_turn_and_returns_its_transcript():
-    channel, listener, display = make_channel(turns=[None, None, ONE_SECOND], stt=["two fries"])
+    channel, listener, display = make_channel(turns=[None, None, said()], stt=["two fries"])
     assert channel.read() == "two fries"
     assert listener.calls == ["listen:0"]
     assert ("you", "two fries") in display.lines
@@ -415,7 +456,7 @@ def test_read_waits_for_a_turn_and_returns_its_transcript():
 
 def test_noise_is_ignored_and_failed_transcriptions_ask_again():
     channel, listener, display = make_channel(
-        turns=[ONE_SECOND, ONE_SECOND, ONE_SECOND], stt=["", SpeechError("down"), "a cola"]
+        turns=[said(), said(), said()], stt=["", SpeechError("down"), "a cola"]
     )
     assert channel.read() == "a cola"
     assert listener.calls == ["listen:0"] * 3
@@ -426,9 +467,7 @@ def test_noise_is_ignored_and_failed_transcriptions_ask_again():
 
 def test_reply_pauses_the_mic_speaks_and_drives_the_agent_bar():
     tts, player = FakeTTS(), FakePlayer()
-    channel, listener, display = make_channel(
-        turns=[ONE_SECOND], stt=["yes"], tts=tts, player=player
-    )
+    channel, listener, display = make_channel(turns=[said()], stt=["yes"], tts=tts, player=player)
     channel.reply("Total: $11.50. Ready to submit?")
     assert listener.calls == ["pause"]
     assert ("agent", "Total: $11.50. Ready to submit?") in display.lines
@@ -476,6 +515,93 @@ def test_channel_opens_and_closes_its_resources_in_order():
     with channel:
         assert events == ["open display", "open mic"]
     assert events == ["open display", "open mic", "close mic", "close display"]
+
+
+# ------------------------------------------------------------------ voice trace & cost
+
+
+def test_a_turn_trace_breaks_down_the_response_time():
+    clock = Clock()
+    stt = FakeSTT(["a large margherita"], clock=clock, latency_s=0.4)
+    tts = FakeTTS(clock=clock, first_chunk_s=0.3)
+    player = FakePlayer(clock=clock, playback_s=2.0)
+    # The endpointer handed the turn over 20 ms ago, after a 900 ms pause.
+    turn = said(ONE_SECOND, at=clock.now - 0.02, wait_ms=900)
+    channel, _, _ = make_channel(turns=[turn], stt_fake=stt, tts=tts, player=player, clock=clock)
+
+    channel.read()
+    clock.advance(1.2)  # agent.send()
+    channel.reply("Large Margherita Pizza. Anything else?")
+    (section,) = channel.trace_sections()
+    record = section.to_record()
+
+    assert section.name == "voice"
+    assert record["latency_ms"] == {
+        "total": pytest.approx(2820, abs=0.2),
+        "end_of_speech": 900,
+        "stt": pytest.approx(400),
+        "agent": pytest.approx(1200),
+        "tts_first_audio": pytest.approx(300),
+        "other": pytest.approx(20, abs=0.2),  # the hand-off after detection
+    }
+    (attempt,) = record["stt"]["attempts"]
+    assert attempt["outcome"] == "ok"
+    assert record["stt"]["keyterms"] == 1
+    assert record["tts"]["model"] == "eleven_flash_v2_5"
+    assert record["tts"]["total_ms"] == pytest.approx(2300)
+    # 1 s at $0.27/h (Scribe + keyterms), and the spoken text at $0.04 per 1K chars.
+    spoken = len(tts.spoken[0])
+    assert record["cost_usd"] == pytest.approx(0.27 / 3600 + spoken * 0.04 / 1000, abs=1e-6)
+    assert channel.trace_sections() == ()  # handed over once
+
+
+def test_retries_are_traced_and_billed_but_failed_calls_are_not():
+    channel, _, _ = make_channel(
+        turns=[said(), said(), said()], stt=["", SpeechError("down"), "a cola"]
+    )
+    channel.read()
+    channel.reply("")  # nothing to speak
+    (section,) = channel.trace_sections()
+    attempts = section.to_record()["stt"]["attempts"]
+    assert [a["outcome"] for a in attempts] == ["empty", "error", "ok"]
+    assert attempts[1]["cost_usd"] == 0
+    assert attempts[1]["error"] == "down"
+    assert section.cost_usd == pytest.approx(2 * 0.27 / 3600, abs=1e-9)
+    assert section.to_record()["latency_ms"] is None  # no audio was played
+
+
+def test_unpriced_speech_models_make_the_cost_unknown_not_zero():
+    channel, _, _ = make_channel(
+        turns=[said()], stt_fake=FakeSTT(["hi"], stt_model="some_new_model")
+    )
+    channel.read()
+    channel.reply("Hello!")
+    (section,) = channel.trace_sections()
+    assert section.cost_usd is None
+
+
+@dataclass
+class InterruptingPlayer:
+    """Ctrl+C after ``chunks`` chunks have been played."""
+
+    chunks: int
+
+    def play(self, chunks: Iterable[bytes], sample_rate: int, on_level=None) -> None:
+        for n, _ in enumerate(chunks, start=1):
+            if n >= self.chunks:
+                raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize(("played_chunks", "billed"), [(1, True), (0, False)])
+def test_interrupted_speech_is_billed_once_audio_has_arrived(played_chunks, billed):
+    player = InterruptingPlayer(played_chunks) if played_chunks else FakePlayer(KeyboardInterrupt())
+    channel, _, _ = make_channel(turns=[said()], stt=["hi"], player=player)
+    channel.read()
+    channel.reply("Hello!")
+    (section,) = channel.trace_sections()
+    tts = section.to_record()["tts"]
+    assert tts["outcome"] == "interrupted"
+    assert (tts["cost_usd"] > 0) is billed
 
 
 # ------------------------------------------------------------------ optional extra & wiring

@@ -154,10 +154,17 @@ The cart is kept, and the next turn works normally. The tool loop is capped at
   usage, estimated cost and errors. A turn maps directly onto an OpenTelemetry trace (turn = root
   span, steps = child spans), so exporting to Langfuse, Phoenix or OTel is a sink change, not a
   redesign.
+- **Front-ends add sections to the same record.** `send(..., keep_turn_open=True)` holds the
+  record until `close_turn(*sections)`; each section lands under its name and its cost in
+  `usage` (`<name>_cost_usd`, folded into `cost_usd`; `llm_cost_usd` stays separate). The REPL
+  always does this, so in voice mode one record covers the whole spoken exchange, including the
+  speech after the agent has answered (see [section 11](#11-voice-an-optional-front-end)). The
+  programmatic `send()` is unchanged.
 
 ```bash
 jq -c 'select(.event=="llm.call") | {turn, latency_ms, prompt_tokens}' logs/agent.jsonl
 jq -c '{turn, user_message, assistant_message, usage}' logs/conversations/conv_*.jsonl
+jq -c 'select(.voice) | {turn, latency: .voice.latency_ms, cost: .usage}' logs/conversations/conv_*.jsonl
 ```
 
 ### 8. Performance & cost
@@ -172,10 +179,13 @@ jq -c '{turn, user_message, assistant_message, usage}' logs/conversations/conv_*
 - **No LLM call** for empty or oversized input. `max_tokens` is capped. Tokens (including cached
   prompt tokens) and estimated cost are logged for every call and every turn.
 - **Cache-aware cost estimates.** Prices live in a per-model registry in code
-  (`food_agent/pricing.py`), not in configuration. Cached prompt tokens (reported by the provider
+  (`food_agent/pricing.py`), not in configuration, for the LLM and the speech models alike. Cached prompt tokens (reported by the provider
   as a subset of prompt tokens) are billed at the cached-input rate, the rest at the input rate.
   A model without a registered price logs `llm.pricing_missing` at startup and its cost is
   reported as `null` rather than a misleading partial number.
+- **Session totals.** `FoodOrderAgent.usage` accumulates every turn of the process (across
+  `/reset`), per source: `llm`, and each section's parts (`voice stt`, `voice tts`). The REPL
+  prints it, dimmed, however the session ends.
 - **Connect per submission.** Orders are submitted about once per conversation, so the MCP session
   is opened only when needed. The cost is one handshake per order. In return `send()` stays
   synchronous, there is no background event loop to manage, and per-request headers are trivial.
@@ -260,7 +270,29 @@ mic (always on, 16 kHz) ─► endpointer ─► Scribe v2 STT ─► agent.send
   `2x` → "2", bullets and markup flattened into sentences. The screen shows the exact text.
 - **Low latency where it is cheap.** Flash v2.5 (the lowest-latency TTS) streams raw PCM, which
   is played as it arrives (no MP3 decoding, no ffmpeg), re-chunked on sample boundaries so a
-  network split never garbles the audio. Logs record STT latency, time to first audio and total
-  playback time per turn (`voice.stt`, `voice.tts`).
+  network split never garbles the audio.
+- **Where the time goes, per turn.** The turn record's `voice` section splits the response time
+  the customer feels, from the moment they stop talking to the agent's first audio, into
+  `end_of_speech` (the pause the endpointer waits for), `stt`, `agent`, `tts_first_audio` and
+  `other` (hand-off and text rewriting). Every STT attempt is listed with its outcome, so noise
+  that transcribed to nothing and failed calls are visible too, and TTS records time to first
+  audio, total time and whether it was interrupted. For example:
+
+  ```json
+  "latency_ms": {"total": 2770, "end_of_speech": 900, "stt": 450, "agent": 1100,
+                 "tts_first_audio": 320, "other": 0}
+  ```
+
+  Timestamps are taken on one monotonic clock across the audio thread and the conversation, and
+  the clock is injectable, so the breakdown is unit-tested with simulated durations.
+- **What speech costs, per turn.** Same approach as LLM tokens: ElevenLabs list prices live in
+  the registry (Scribe v2 per audio hour plus the keyterm add-on, Flash v2.5 per 1,000
+  characters), each attempt and each synthesis is priced, and the total goes into the turn's
+  `usage` as `voice_cost_usd`. Billable work that the customer never sees (re-tried noise) is
+  included; failed requests and synthesis stopped before any audio arrived are assumed free.
+  An unpriced model makes the cost `null`, not zero. STT is estimated per second of audio, so it
+  is a lower bound if the provider rounds short clips up. At list prices speech dominates: a
+  typical turn's TTS costs tens of times more than its LLM calls, because each reply is billed
+  per character spoken, so short voice replies are a cost lever as well as a UX one.
 - **Speech failures never end the order.** A failed transcription asks the customer to say it
   again; a failed synthesis leaves the printed reply; Ctrl+C stops the audio, not the session.

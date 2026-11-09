@@ -40,7 +40,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp_types import CallToolResult, TextContent
 
-log = structlog.get_logger(__name__)
+logger = structlog.get_logger(__name__)
 
 TOOL_NAME = "submit_order"
 
@@ -183,7 +183,7 @@ class McpOrderSubmitter:
             attempts.append(
                 {"attempt": attempt, "outcome": outcome.value, "latency_ms": latency_ms}
             )
-            log.info(
+            logger.info(
                 "mcp.submit_attempt",
                 attempt=attempt,
                 outcome=outcome.value,

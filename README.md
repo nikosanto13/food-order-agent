@@ -217,9 +217,10 @@ jq -c '{turn, user_message, assistant_message, usage}' logs/conversations/conv_*
 
 ### 8. Performance & cost
 - **Small model by default** (`mistral-small-latest`). The task is narrow and the hard guarantees
-  live in code, so a frontier model isn't needed. The model is one env var away.
+  live in code, so a frontier model probably isn't necessary.
 - **Static prompt prefix** (instructions + menu, rendered once and compactly), with the dynamic
-  state at the end so provider-side prefix caching can reuse it.
+  state at the end so provider-side prefix caching can reuse it (input vs. cache input tokens
+  are shown in logs).
 - **Bounded context.** History is trimmed to the last N messages, always cut at a user-message
   boundary so a tool result is never separated from its tool call. Because the cart is in the
   prompt, old turns aren't needed.
@@ -290,18 +291,16 @@ make audit      # scan locked dependencies for known vulnerabilities
 
 ---
 
-## Roadmap
+## Future steps
 
-- **Evals** (next): scripted multi-turn scenarios run against the real LLM and the mock server. The
+- **Voice** (next): STT → `agent.send()` → TTS (ElevenLabs), with shorter, speech-friendly replies.
+- **Evals**: scripted multi-turn scenarios run against the real LLM and the mock server. The
   assertions are deterministic: the final submitted payload, no submission without confirmation,
   the right clarifying questions. The report covers pass rate, tokens, cost and p50/p95 latency per
   model, so model choice is a measured decision. Possibly an LLM-as-judge for tone.
 - **Prod MCP contract tests**: a `@pytest.mark.live` suite against the provided server, checking
   the classification table above (including whether refusals expose a machine-readable code).
-- **Voice**: STT → `agent.send()` → TTS (ElevenLabs), with shorter, speech-friendly replies.
-- Session persistence (Redis) and an async `asend()` for serving many concurrent conversations.
-  Streaming replies.
-- OTel / Langfuse export of the traces, plus dashboards for latency, cost per order and guard
-  activations.
-- Fuzzy matching for misspelled items before the LLM fallback; menu hot-reload; multi-language
-  support.
+- Extension to provide additional model providers.
+- Interactive mode for text agent / streaming replies.
+- OTel / Langfuse export of the traces, plus dashboards for latency, cost per order and guard activations.
+- Fuzzy matching for misspelled items before the LLM fallback.

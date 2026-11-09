@@ -42,7 +42,9 @@ class Settings(BaseSettings):
     elevenlabs_stt_model: str = "scribe_v2"
     voice_language: str = "en"
     voice_stt_keyterms: bool = True  # bias STT towards menu words (billed extra by ElevenLabs)
-    voice_max_record_s: float = Field(default=30, gt=0, le=300)
+    voice_end_silence_ms: int = Field(default=900, ge=200, le=5000)  # pause that ends a turn
+    voice_vad_margin_db: float = Field(default=12, ge=3, le=40)  # how far above room noise
+    voice_max_utterance_s: float = Field(default=30, gt=0, le=300)
     voice_timeout_s: float = Field(default=30, gt=0)
 
     # --- Observability ---

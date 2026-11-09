@@ -8,14 +8,14 @@ The core agent never imports anything from here.
 """
 
 from food_agent.voice.audio import Audio
-from food_agent.voice.channel import VoiceChannel, build_voice_channel
+from food_agent.voice.channel import HandsFreeChannel, build_voice_channel
 from food_agent.voice.errors import SpeechError, VoiceUnavailableError
 from food_agent.voice.speakable import to_speech
 
 __all__ = [
     "Audio",
+    "HandsFreeChannel",
     "SpeechError",
-    "VoiceChannel",
     "VoiceUnavailableError",
     "build_voice_channel",
     "to_speech",

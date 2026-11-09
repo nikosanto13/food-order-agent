@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 voice = [
     "elevenlabs>=2.77.0",
+    "rich>=15.0.0",
     "sounddevice>=0.5.6",
 ]
 

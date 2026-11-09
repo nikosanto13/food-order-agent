@@ -36,19 +36,27 @@ REPL commands: `/cart`, `/reset`, `/trace` (path of this conversation's trace), 
 
 ### Voice mode (optional)
 
-Talk to the agent instead of typing: ElevenLabs Scribe transcribes you, the same agent handles
-the order, and ElevenLabs Flash speaks the reply.
+Hands-free: just talk. ElevenLabs Scribe transcribes you, the same agent handles the order,
+and ElevenLabs Flash speaks the reply, with live level bars for you and the agent.
 
 ```bash
-uv sync --extra voice         # optional extra: elevenlabs + sounddevice
+uv sync --extra voice         # optional extra: elevenlabs + sounddevice + rich
 # set ELEVENLABS_API_KEY in .env
 python main.py --voice --local
 ```
 
-Press **Enter** to start talking and **Enter** again when you're done. You can still type a
-message (or a `/command`) instead. Ctrl+C while the agent speaks stops the audio, not the
-session. Without the extra, everything else installs and runs as before; `--voice` just tells
-you what to install. See [design notes](docs/ARCHITECTURE.md#11-voice-an-optional-front-end).
+```
+You: a large margherita with olives
+Agent: Large Margherita Pizza with olives. Anything else?
+● Speaking        you
+Ctrl+C to quit    agent   ▃▅▆▆▅▃▁▂▄▆▆▆▄▁▂▄▆▆▆▄▂▁▃▅▆▆▅▂ ▃▅
+```
+
+Pause for about a second to end your turn. The microphone is off while the agent speaks, so
+it never hears itself, but headphones still work best. Ctrl+C while the agent speaks stops the
+audio; Ctrl+C while listening quits. Without the extra, everything else installs and runs as
+before; `--voice` just tells you what to install. See
+[design notes](docs/ARCHITECTURE.md#11-voice-an-optional-front-end).
 
 ### Programmatic API
 
@@ -93,7 +101,9 @@ and has a seedable random "kitchen busy" rate.
 | `ELEVENLABS_VOICE_ID` | `JBFqnCBsd6RMkjVDRZzb` | TTS voice |
 | `ELEVENLABS_TTS_MODEL`, `ELEVENLABS_STT_MODEL` | `eleven_flash_v2_5`, `scribe_v2` | Speech models |
 | `VOICE_STT_KEYTERMS` | `true` | Bias transcription towards menu words (billed extra) |
-| `VOICE_MAX_RECORD_S` | `30` | Longest utterance kept |
+| `VOICE_END_SILENCE_MS` | `900` | Pause that ends your turn |
+| `VOICE_VAD_MARGIN_DB` | `12` | How much louder than the room counts as speech (raise in noisy rooms) |
+| `VOICE_MAX_UTTERANCE_S` | `30` | Longest turn kept |
 | `LOG_LEVEL`, `LOG_DIR`, `LOG_TO_STDERR` | `INFO`, `logs`, `false` | Observability |
 
 ---
@@ -131,8 +141,10 @@ weekly audit.
 
 ## Future steps
 
-- **Voice, streaming**: realtime STT with server-side turn detection (no push-to-talk), stream
-  the LLM reply into TTS sentence by sentence, and let the customer interrupt the agent.
+- **Voice, full duplex**: let the customer interrupt the agent (barge-in, which needs echo
+  cancellation instead of muting the mic), stream the LLM reply into TTS sentence by sentence,
+  and swap the energy detector for a model-based VAD (e.g. Silero) or realtime STT with
+  server-side turn detection if noisy rooms turn out to matter.
 - **Evals**: scripted multi-turn scenarios run against the real LLM and the mock server. The
   assertions are deterministic: the final submitted payload, no submission without confirmation,
   the right clarifying questions. The report covers pass rate, tokens, cost and p50/p95 latency per

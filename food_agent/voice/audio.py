@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import io
+import math
+import sys
 import wave
+from array import array
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
@@ -47,3 +50,33 @@ def aligned_frames(chunks: Iterable[bytes]) -> Iterator[bytes]:
         carry = data[cut:]
         if cut:
             yield data[:cut]
+
+
+SILENCE_DB = -96.0  # level reported for digital silence (and empty input)
+_METER_FLOOR_DB = -55.0  # quieter than this shows as an empty bar
+_METER_CEIL_DB = -12.0  # louder than this shows as a full bar
+
+
+def rms_dbfs(pcm: bytes) -> float:
+    """Loudness of a PCM16 frame in dB relative to full scale (0 = clipping)."""
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - len(pcm) % SAMPLE_WIDTH])
+    if sys.byteorder == "big":
+        samples.byteswap()  # PCM on the wire is little-endian
+    if not samples:
+        return SILENCE_DB
+    mean_square = sum(s * s for s in samples) / len(samples)
+    if mean_square == 0:
+        return SILENCE_DB
+    return max(SILENCE_DB, 10 * math.log10(mean_square / 32768**2))
+
+
+def loudness(pcm: bytes) -> float:
+    """Frame loudness mapped to 0..1 for the level bars (speech lands mid-range)."""
+    db = rms_dbfs(pcm)
+    return min(1.0, max(0.0, (db - _METER_FLOOR_DB) / (_METER_CEIL_DB - _METER_FLOOR_DB)))
+
+
+def split_frames(pcm: bytes, frame_bytes: int) -> Iterator[bytes]:
+    for start in range(0, len(pcm), frame_bytes):
+        yield pcm[start : start + frame_bytes]

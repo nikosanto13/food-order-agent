@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from types import ModuleType
-from typing import Any
+from typing import Any, Self
 
-from food_agent.voice.audio import SAMPLE_WIDTH, Audio, aligned_frames
+from food_agent.voice.audio import SAMPLE_WIDTH, aligned_frames, loudness, split_frames
 from food_agent.voice.errors import INSTALL_HINT, PORTAUDIO_HINT, VoiceUnavailableError
 
 MIC_SAMPLE_RATE = 16_000  # what speech recognition needs; more is just upload size
@@ -23,29 +23,51 @@ def _sounddevice() -> ModuleType:
 
 
 class Microphone:
-    """Push-to-talk recorder: captures from the default input until told to stop."""
+    """Always-on capture from the default input, delivered in fixed-size frames.
 
-    def __init__(self, sample_rate: int = MIC_SAMPLE_RATE) -> None:
+    ``on_audio`` runs on the audio thread for every frame; keep it cheap (the
+    ``Listener`` just runs the endpointer). Use as a context manager.
+    """
+
+    def __init__(
+        self,
+        on_audio: Callable[[bytes], None],
+        *,
+        sample_rate: int = MIC_SAMPLE_RATE,
+        frame_ms: int = 20,
+    ) -> None:
         self._sd = _sounddevice()
+        self._on_audio = on_audio
         self.sample_rate = sample_rate
+        self._blocksize = sample_rate * frame_ms // 1000
+        self._stream: Any = None
 
-    def record(self, wait_for_stop: Callable[[], object], max_seconds: float) -> Audio:
-        """Record until ``wait_for_stop()`` returns; keeps at most ``max_seconds``."""
-        limit = int(max_seconds * self.sample_rate) * SAMPLE_WIDTH
-        chunks: list[bytes] = []
-        size = 0
+    def __enter__(self) -> Self:
+        def callback(indata: Any, _frames: int, _time: Any, _status: Any) -> None:
+            self._on_audio(bytes(indata))
 
-        def on_audio(indata: Any, _frames: int, _time: Any, _status: Any) -> None:
-            nonlocal size
-            if size < limit:  # past the cap, keep the stream open but drop the audio
-                chunks.append(bytes(indata))
-                size += len(indata)
+        try:
+            self._stream = self._sd.RawInputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=self._blocksize,
+                callback=callback,
+            )
+            self._stream.start()
+        except self._sd.PortAudioError as exc:
+            raise VoiceUnavailableError(
+                f"could not open the microphone ({exc}). Check that one is connected and that "
+                "your terminal has microphone permission (macOS: System Settings > Privacy & "
+                "Security > Microphone)."
+            ) from exc
+        return self
 
-        with self._sd.RawInputStream(
-            samplerate=self.sample_rate, channels=1, dtype="int16", callback=on_audio
-        ):
-            wait_for_stop()
-        return Audio(b"".join(chunks)[:limit], self.sample_rate)
+    def __exit__(self, *_exc: object) -> None:
+        if self._stream is not None:
+            self._stream.abort()
+            self._stream.close()
+            self._stream = None
 
 
 class Speaker:
@@ -54,11 +76,23 @@ class Speaker:
     def __init__(self) -> None:
         self._sd = _sounddevice()
 
-    def play(self, chunks: Iterable[bytes], sample_rate: int) -> None:
-        with self._sd.RawOutputStream(samplerate=sample_rate, channels=1, dtype="int16") as out:
+    def play(
+        self,
+        chunks: Iterable[bytes],
+        sample_rate: int,
+        on_level: Callable[[float], None] | None = None,
+    ) -> None:
+        """Play a PCM16 mono stream; report each 20 ms frame's loudness as it is queued."""
+        frame_bytes = sample_rate // 50 * SAMPLE_WIDTH
+        with self._sd.RawOutputStream(
+            samplerate=sample_rate, channels=1, dtype="int16", latency="low"
+        ) as out:
             try:
-                for frame in aligned_frames(chunks):
-                    out.write(frame)
+                for chunk in aligned_frames(chunks):
+                    for frame in split_frames(chunk, frame_bytes):
+                        if on_level is not None:
+                            on_level(loudness(frame))
+                        out.write(frame)
             except KeyboardInterrupt:
                 out.abort()  # stop now instead of draining the buffer
                 raise

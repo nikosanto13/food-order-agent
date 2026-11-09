@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
-from typing import Protocol
+from typing import Protocol, Self
 
 from food_agent.agent import FoodOrderAgent
 from food_agent.config import Settings
@@ -26,7 +26,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--voice",
         action="store_true",
-        help="talk instead of type (needs `uv sync --extra voice` and ELEVENLABS_API_KEY)",
+        help="hands-free voice mode (needs `uv sync --extra voice` and ELEVENLABS_API_KEY)",
     )
     p.add_argument("--busy-rate", type=float, default=0.1, help="mock kitchen-busy rate (--local)")
     p.add_argument("--verbose", action="store_true", help="stream JSON logs to stderr")
@@ -39,13 +39,24 @@ def _parse_args() -> argparse.Namespace:
 
 
 class Channel(Protocol):
-    """Where user messages come from and replies go: the keyboard, or voice."""
+    """Where user messages come from and replies go: the keyboard, or voice.
 
+    A context manager, so a voice channel can own its microphone and live display.
+    """
+
+    def __enter__(self) -> Self: ...
+    def __exit__(self, *exc: object) -> None: ...
     def read(self) -> str: ...
     def reply(self, message: str) -> None: ...
 
 
 class TextChannel:
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
     def read(self) -> str:
         return input("You: ").strip()
 
@@ -53,18 +64,21 @@ class TextChannel:
         print(f"Agent: {message}")
 
 
-def _voice_channel(settings: Settings, menu: Menu) -> Channel:
+def _open_voice_channel(settings: Settings, menu: Menu, stack: contextlib.ExitStack) -> Channel:
     # Imported here so text mode never depends on the optional voice extra.
     from food_agent.voice import VoiceUnavailableError, build_voice_channel  # noqa: PLC0415
 
     try:
-        return build_voice_channel(settings, menu)
+        channel = stack.enter_context(build_voice_channel(settings, menu))
     except VoiceUnavailableError as exc:
         raise SystemExit(f"Voice mode unavailable: {exc}") from exc
+    print("Hands-free voice mode: just talk, and pause when you're done. Ctrl+C to quit.")
+    return channel
 
 
 def _repl(agent: FoodOrderAgent, channel: Channel) -> None:
-    print(f"Food ordering assistant ({agent.llm.model}). {HELP}")
+    commands = f" {HELP}" if isinstance(channel, TextChannel) else ""
+    print(f"Food ordering assistant ({agent.llm.model}).{commands}")
     print(f"Conversation: {agent.conversation_id}\n")
     while True:
         try:
@@ -119,7 +133,10 @@ def main() -> None:
             overrides.setdefault("applicant_email", "local@example.com")
         settings = base.model_copy(update=overrides)
         agent = FoodOrderAgent(settings=settings)
-        channel = _voice_channel(settings, agent.menu) if args.voice else TextChannel()
+        if args.voice:
+            channel = _open_voice_channel(settings, agent.menu, stack)
+        else:
+            channel = stack.enter_context(TextChannel())
         _repl(agent, channel)
 
 

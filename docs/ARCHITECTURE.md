@@ -45,7 +45,7 @@ user text ─►│ pre-checks ─► LLM ◄──► ToolExecutor ──► Or
 | `food_agent/mcp_client.py` | MCP client: outcome classification, retry policy, idempotency |
 | `food_agent/mock_server.py` | Local MCP server with the same contract (dev + tests) |
 | `food_agent/observability.py` | structlog JSON config, redaction, per-turn trace records |
-| `food_agent/voice/` | Optional voice front-end (`--extra voice`): push-to-talk channel, ElevenLabs STT/TTS, audio devices, speakable text |
+| `food_agent/voice/` | Optional voice front-end (`--extra voice`): hands-free channel, turn detection, live level bars, ElevenLabs STT/TTS, audio devices, speakable text |
 | `agent.py`, `main.py` | Required entry points |
 
 ---
@@ -215,20 +215,40 @@ The agent is deliberately **strict about the order and relaxed about the convers
 
 ### 11. Voice: an optional front-end
 ```
-Enter ─► mic (16 kHz PCM) ─► Scribe v2 STT ─► agent.send() ─► speakable text ─► Flash v2.5 TTS ─► speaker
-         push-to-talk         + menu keyterms   (unchanged)     ($11.50 → "11 dollars 50")   streamed PCM
+mic (always on, 16 kHz) ─► endpointer ─► Scribe v2 STT ─► agent.send() ─► speakable text ─► Flash v2.5 TTS ─► speaker
+                           speech…pause    + menu keyterms  (unchanged)    ($11.50 → "11 dollars 50")    streamed PCM
+          └──────────── live "you" / "agent" level bars + status (rich) ────────────┘
 ```
-- **A channel, not a new agent.** `main.py` reads from and replies to a two-method channel
-  (`read()` / `reply()`); voice is a second implementation next to the keyboard. Cart, guards,
-  confirmation and MCP handling are the same code, so every guarantee above holds when speaking.
-  The only agent-side change is `REPLY_STYLE=voice`, which appends a short prompt section: input
-  is a transcript (match misheard words to the menu by sound, ask when it matters), and replies
-  are one or two speakable sentences that still state every item and the exact total at review.
-- **Optional by construction.** `elevenlabs` and `sounddevice` live in the `voice` extra and are
-  imported only when a speech client or audio device is created. A missing extra, a missing
-  PortAudio library or a missing key becomes `VoiceUnavailableError` with the fix in the
-  message. `main.py` imports the voice package only under `--voice`. CI runs the suite with
-  and without the extras.
+- **A channel, not a new agent.** `main.py` reads from and replies to a channel (`read()` /
+  `reply()`, used as a context manager); hands-free voice is a second implementation next to
+  the keyboard. Cart, guards, confirmation and MCP handling are the same code, so every
+  guarantee above holds when speaking. The only agent-side change is `REPLY_STYLE=voice`,
+  which appends a short prompt section: input is a transcript (match misheard words to the menu
+  by sound, ask when it matters), and replies are one or two speakable sentences that still
+  state every item and the exact total at review.
+- **Hands-free turn taking, locally.** The microphone streams 20 ms frames into an energy-based
+  endpointer (`voice/vad.py`): a turn starts after 100 ms of audio clearly above the room
+  (`VOICE_VAD_MARGIN_DB`) and ends after a pause (`VOICE_END_SILENCE_MS`); 300 ms of pre-roll
+  keeps the first syllable, and blips too short to be words are dropped. The noise floor is the
+  quietest frame of the last few seconds: gaps between words keep it low while you talk, and a
+  steady noise that starts later (a fan) becomes the new floor instead of an endless turn.
+  Anything that slips through as noise transcribes to nothing and is ignored. It needs no model
+  and no extra dependency, and is unit-tested with synthetic audio. A model-based VAD is the
+  upgrade path if noisy rooms matter.
+- **Half-duplex, on purpose.** The microphone is ignored while the agent thinks and speaks, and
+  for 300 ms afterwards, so the agent never transcribes its own voice from the speakers. The
+  cost is no barge-in: interrupting the agent needs acoustic echo cancellation, which the
+  roadmap covers.
+- **Live feedback.** A `rich` live region shows the state (listening, hearing you,
+  transcribing, thinking, speaking) and two scrolling level bars: the mic level while it is your
+  turn, the level of each frame actually sent to the speaker while the agent talks. Levels are
+  pushed from the audio threads into a small time-ticked meter (`voice/meter.py`), so the bars
+  fall flat in silence instead of freezing. Transcript lines and ordinary output scroll above.
+- **Optional by construction.** `elevenlabs`, `sounddevice` and `rich` live in the `voice`
+  extra and are imported only when a speech client, an audio device or the display is created.
+  A missing extra, PortAudio, microphone permission or API key becomes `VoiceUnavailableError`
+  with the fix in the message. `main.py` imports the voice package only under `--voice`. CI runs
+  the suite with and without the extras.
 - **Recognition is biased towards the menu.** Item names, option choices and extras are sent as
   Scribe *keyterms* (derived from `menu.yaml`, so never stale), which is what turns
   "margarita" into "margherita". `no_verbatim` drops fillers and false starts; audio-event tags
@@ -242,9 +262,5 @@ Enter ─► mic (16 kHz PCM) ─► Scribe v2 STT ─► agent.send() ─► sp
   is played as it arrives (no MP3 decoding, no ffmpeg), re-chunked on sample boundaries so a
   network split never garbles the audio. Logs record STT latency, time to first audio and total
   playback time per turn (`voice.stt`, `voice.tts`).
-- **Speech failures never end the order.** A failed or empty transcription asks the customer to
-  try again (or type); a failed synthesis falls back to the printed reply; Ctrl+C stops the
-  audio, not the session.
-- **Push-to-talk over voice activity detection**: explicit turns are robust to background noise
-  and need no tuning, which suits a terminal demo. Realtime STT with server-side turn detection
-  and barge-in is the next step (see the [roadmap](../README.md#future-steps)).
+- **Speech failures never end the order.** A failed transcription asks the customer to say it
+  again; a failed synthesis leaves the printed reply; Ctrl+C stops the audio, not the session.

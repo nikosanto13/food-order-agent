@@ -276,9 +276,32 @@ class Cart:
         options: Mapping[str, str] | None = None,
         add_extras: Sequence[str] | None = None,
         remove_extras: Sequence[str] | None = None,
+        units: int | None = None,
     ) -> LineItem:
-        """Apply a partial change and re-validate the *whole* line."""
+        """Apply a partial change and re-validate the *whole* line.
+
+        ``units`` applies the change to only that many units of a multi-unit line
+        ("three burgers, add extras to one of them"): the line is split, the
+        original keeps ``quantity - units`` unchanged units, and a new line with
+        ``units`` units carries the change. Returns the line that carries the
+        change, so ``result.line_id != line_id`` means a split happened.
+        """
         current = self.get(line_id)
+        if units is not None and units != current.quantity:
+            if quantity is not None:
+                raise OrderError(
+                    "Pass either units (change some of the line) or quantity (change how many), "
+                    "not both."
+                )
+            if not 1 <= units < current.quantity:
+                raise OrderError(
+                    f"Line {line_id} has {current.quantity}; units must be between 1 and "
+                    f"{current.quantity}. Omit units to change the whole line."
+                )
+            quantity = units
+            split = True
+        else:
+            split = False
         merged_options = {**current.options, **(options or {})}
         drop = {normalize_token(e) for e in remove_extras or ()}
         not_present = sorted(drop - set(current.extras))
@@ -288,21 +311,44 @@ class Cart:
                 f"current extras: {', '.join(current.extras) or 'none'}."
             )
         extras = [e for e in current.extras if e not in drop] + list(add_extras or ())
-        line = build_line(
+        line = build_line(  # validate before touching the cart: a failed change changes nothing
             self._menu,
-            line_id=line_id,
+            line_id=self._next_id if split else line_id,
             item_id=current.item_id,
             quantity=current.quantity if quantity is None else quantity,
             options=merged_options,
             extras=extras,
         )
-        self._lines[line_id] = line
+        if split:
+            self._lines[line_id] = current.model_copy(
+                update={"quantity": current.quantity - line.quantity}
+            )
+            self._next_id += 1
+        self._lines[line.line_id] = line
         return line
 
-    def remove(self, line_id: int) -> LineItem:
+    def remove(self, line_id: int, quantity: int | None = None) -> tuple[LineItem, LineItem | None]:
+        """Remove ``quantity`` units of a line, or the whole line when ``quantity`` is None.
+
+        Returns ``(removed, remaining)``: ``removed`` describes what was taken out
+        (with the removed quantity) and ``remaining`` is the line left behind, or
+        None if the line is gone. "Remove one of the three burgers" is therefore a
+        deterministic decrement, not a judgement call left to the model.
+        """
         line = self.get(line_id)
-        del self._lines[line_id]
-        return line
+        if quantity is None or quantity == line.quantity:
+            del self._lines[line_id]
+            return line, None
+        if quantity < 1:
+            raise OrderError(f"Quantity to remove must be at least 1, got {quantity}.")
+        if quantity > line.quantity:
+            raise OrderError(
+                f"Line {line_id} only has {line.quantity}; cannot remove {quantity}. "
+                "Omit quantity to remove the whole line."
+            )
+        remaining = line.model_copy(update={"quantity": line.quantity - quantity})
+        self._lines[line_id] = remaining
+        return line.model_copy(update={"quantity": quantity}), remaining
 
     @property
     def total(self) -> Decimal:
@@ -377,6 +423,10 @@ class OrderSession:
         self.phase = OrderPhase.BUILDING
         self._reviewed_fingerprint: str | None = None
         self._reviewed_turn: int | None = None
+        # True once the customer has asked to check out (review attempted, even if it
+        # failed, e.g. over the limit). While set, changes trigger a fresh review so the
+        # agent never asks "Ready to submit?" about a cart it has not re-validated.
+        self.checkout_requested = False
         self.submitted_orders: list[dict[str, Any]] = []
 
     def _invalidate_review(self) -> None:
@@ -394,10 +444,16 @@ class OrderSession:
         self._invalidate_review()
         return line
 
-    def remove(self, line_id: int) -> LineItem:
-        line = self.cart.remove(line_id)
+    def remove(self, line_id: int, quantity: int | None = None) -> tuple[LineItem, LineItem | None]:
+        removed, remaining = self.cart.remove(line_id, quantity)
         self._invalidate_review()
-        return line
+        return removed, remaining
+
+    def clear(self) -> None:
+        for line in self.cart.lines:
+            self.cart.remove(line.line_id)
+        self.checkout_requested = False  # starting over, not checking out
+        self._invalidate_review()
 
     def set_special_instructions(self, text: str | None) -> str | None:
         self.cart.special_instructions = sanitize_special_instructions(text)
@@ -427,6 +483,7 @@ class OrderSession:
             )
 
     def review(self, turn: int) -> str:
+        self.checkout_requested = True
         self.validate_for_submission()
         self.phase = OrderPhase.AWAITING_CONFIRMATION
         self._reviewed_fingerprint = self.cart.fingerprint()
@@ -458,4 +515,5 @@ class OrderSession:
             {"payload": self.cart.to_submit_payload(), "result": dict(result)}
         )
         self.cart = Cart(self.menu)
+        self.checkout_requested = False
         self._invalidate_review()

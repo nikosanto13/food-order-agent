@@ -265,3 +265,195 @@ def test_every_turn_is_traced(settings):
     assert record["usage"]["llm_calls"] == 2
     assert record["cart"]["total"] == "$3.50"
     assert record["phase"] == "building"
+
+
+# ------------------------------------------------------------------ removal & checkout flow
+def _over_limit_cart_script():
+    """The cart from a real conversation: 3 large + 2 regular burgers = $58.00."""
+    return [
+        tools(
+            call(
+                "add_item",
+                {"item_id": "classic_burger", "quantity": 3, "options": {"size": "large"}},
+            ),
+            call("add_item", {"item_id": "classic_burger", "extras": ["avocado"]}),
+            call(
+                "add_item",
+                {
+                    "item_id": "classic_burger",
+                    "extras": ["cheese", "bacon", "avocado", "extra_patty"],
+                },
+            ),
+        ),
+        say("Added. Anything else?"),
+        tools(call("review_order")),
+        say("Your total is $58.00, over our $50.00 limit. What would you like to change?"),
+    ]
+
+
+def test_remove_one_of_several_units_keeps_the_rest(settings):
+    agent, llm = make_agent(
+        settings,
+        [
+            *_over_limit_cart_script(),
+            tools(call("remove_item", {"line_id": 1, "quantity": 1})),
+            say("Removed one Large Classic Burger. Your order: ... $47.50. Ready to submit?"),
+        ],
+    )
+    agent.send("3 large burgers, one regular with avocado, one regular with all extras")
+    agent.send("lets proceed")
+    agent.send("ah yes, remove the one large")
+
+    result = llm.last_tool_result()
+    assert result["removed_quantity"] == 1
+    assert result["remaining_on_line"]["description"] == "2x Large Classic Burger"
+    assert agent.session.cart.get(1).quantity == 2
+    assert agent.session.cart.snapshot()["total"] == "$47.50"
+
+
+def test_change_during_checkout_re_reviews_so_yes_submits(settings):
+    """After an over-limit review, fixing the cart re-reviews it; the next 'yes' submits."""
+    submitter = CannedSubmitter()
+    agent, llm = make_agent(
+        settings,
+        [
+            *_over_limit_cart_script(),
+            tools(call("remove_item", {"line_id": 1, "quantity": 1})),
+            say("Removed one. Your total is now $47.50. Ready to submit?"),
+            tools(call("submit_order")),
+            say("Order submitted! Order #ORD-12345."),
+        ],
+        submitter,
+    )
+    agent.send("burgers")
+    agent.send("lets proceed")
+    agent.send("remove one large")
+
+    review = llm.last_tool_result()["review"]
+    assert review["ok"] is True
+    assert review["total"] == "$47.50"
+    assert agent.session.phase.value == "awaiting_confirmation"
+
+    r = agent.send("yes")
+    assert r["tool_calls"][0]["result"]["success"] is True
+    assert submitter.payloads[0]["items"][0]["quantity"] == 2
+
+
+def test_change_during_checkout_that_is_still_over_limit_reports_it(settings):
+    agent, llm = make_agent(
+        settings,
+        [
+            *_over_limit_cart_script(),
+            tools(call("update_item", {"line_id": 2, "remove_extras": ["avocado"]})),
+            say("Removed the avocado, but you're still $6.00 over the limit."),
+        ],
+    )
+    agent.send("burgers")
+    agent.send("lets proceed")
+    agent.send("drop the avocado on the second one")
+
+    review = llm.last_tool_result()["review"]
+    assert review["ok"] is False
+    assert "exceeds" in review["error"]
+    assert agent.session.phase.value == "building"
+
+
+def test_changes_before_checkout_do_not_trigger_a_review(settings):
+    agent, llm = make_agent(
+        settings,
+        [tools(call("add_item", {"item_id": "fries"})), say("Added fries. Anything else?")],
+    )
+    agent.send("fries")
+    assert "review" not in llm.last_tool_result()
+    assert agent.session.phase.value == "building"
+
+
+# ------------------------------------------------------------------ partial update & confirmations
+ALL_EXTRAS = ["cheese", "bacon", "avocado", "extra_patty"]
+THREE_LARGE = {"item_id": "classic_burger", "quantity": 3, "options": {"size": "large"}}
+
+
+def test_update_one_of_several_units_splits_the_line(settings):
+    agent, llm = make_agent(
+        settings,
+        [
+            tools(call("add_item", THREE_LARGE)),
+            say("Added 3x Large Classic Burger. Anything else?"),
+            tools(call("update_item", {"line_id": 1, "units": 1, "add_extras": ALL_EXTRAS})),
+            say(
+                "Updated: Large Classic Burger with cheese, bacon, avocado and extra patty; "
+                "2x Large Classic Burger unchanged. Anything else?"
+            ),
+        ],
+    )
+    agent.send("hey, i want three large burgers")
+    r = agent.send("in one of them, i actually want to add all extras")
+
+    result = llm.last_tool_result()
+    assert result["unchanged_on_original_line"]["description"] == "2x Large Classic Burger"
+    assert [ln["quantity"] for ln in agent.session.cart.snapshot()["lines"]] == [2, 1]
+    assert agent.session.cart.snapshot()["total"] == "$39.00"
+    assert "(" not in r["message"]  # the model stated both lines; no guard note needed
+
+
+def test_guard_states_split_when_the_reply_paraphrases_it(settings):
+    agent, _ = make_agent(
+        settings,
+        [
+            tools(call("add_item", THREE_LARGE)),
+            say("Added. Anything else?"),
+            tools(call("update_item", {"line_id": 1, "units": 1, "add_extras": ALL_EXTRAS})),
+            say("Updated one of the large burgers with all extras. Anything else?"),
+        ],
+    )
+    agent.send("three large burgers")
+    r = agent.send("one of them with all extras")
+    assert r["message"].endswith(
+        "(Your order now has: 2x Large Classic Burger; "
+        "Large Classic Burger with cheese, bacon, avocado and extra patty.)"
+    )
+
+
+def test_guard_exposes_a_whole_line_update_described_as_one_unit(settings):
+    """The real bug: all 3 changed, but the model said 'one of them'. The customer must see it."""
+    agent, _ = make_agent(
+        settings,
+        [
+            tools(call("add_item", THREE_LARGE)),
+            say("Added. Anything else?"),
+            tools(call("update_item", {"line_id": 1, "add_extras": ALL_EXTRAS})),
+            say("Updated one of the large burgers with cheese, bacon, avocado and extra patty."),
+        ],
+    )
+    agent.send("three large burgers")
+    r = agent.send("in one of them, add all extras")
+    assert "3x Large Classic Burger with cheese, bacon, avocado and extra patty" in r["message"]
+
+
+def test_guard_states_full_removal_of_a_multi_unit_line(settings):
+    agent, _ = make_agent(
+        settings,
+        [
+            tools(call("add_item", THREE_LARGE)),
+            say("Added. Anything else?"),
+            tools(call("remove_item", {"line_id": 1})),
+            say("Removed the large burger."),
+        ],
+    )
+    agent.send("three large burgers")
+    r = agent.send("remove the large one")
+    assert r["message"].endswith("(Removed: 3x Large Classic Burger.)")
+
+
+def test_guard_stays_silent_for_single_unit_changes(settings):
+    agent, _ = make_agent(
+        settings,
+        [
+            tools(call("add_item", {"item_id": "fries"})),
+            say("Added fries."),
+            tools(call("update_item", {"line_id": 1, "options": {"size": "large"}})),
+            say("Made them large."),
+        ],
+    )
+    agent.send("fries")
+    assert agent.send("make it large") == {"message": "Made them large."}

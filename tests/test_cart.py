@@ -178,3 +178,95 @@ def test_mark_submitted_starts_a_fresh_cart(menu):
     assert session.cart.is_empty
     assert session.phase is OrderPhase.BUILDING
     assert session.submitted_orders[0]["result"]["order_id"] == "ORD-1"
+
+
+# ------------------------------------------------------------------ partial removal
+def test_remove_some_units_decrements_the_line(menu):
+    cart = Cart(menu)
+    line = cart.add("classic_burger", quantity=3, options={"size": "large"})
+    removed, remaining = cart.remove(line.line_id, quantity=1)
+    assert removed.quantity == 1
+    assert remaining is not None
+    assert remaining.quantity == 2
+    assert remaining.line_id == line.line_id  # same line, still addressable
+    assert cart.total == Decimal("21.00")
+
+
+@pytest.mark.parametrize("quantity", [None, 3])
+def test_remove_all_units_or_no_quantity_deletes_the_line(menu, quantity):
+    cart = Cart(menu)
+    line = cart.add("classic_burger", quantity=3)
+    removed, remaining = cart.remove(line.line_id, quantity=quantity)
+    assert removed.quantity == 3
+    assert remaining is None
+    assert cart.is_empty
+
+
+def test_remove_more_units_than_present_is_rejected(menu):
+    cart = Cart(menu)
+    line = cart.add("fries", quantity=2)
+    with pytest.raises(OrderError, match="only has 2; cannot remove 5"):
+        cart.remove(line.line_id, quantity=5)
+    assert cart.get(line.line_id).quantity == 2
+
+
+def test_partial_removal_invalidates_review(menu):
+    session = OrderSession(menu)
+    line = session.add(item_id="fries", quantity=2)
+    session.review(turn=1)
+    session.remove(line.line_id, quantity=1)
+    assert session.phase is OrderPhase.BUILDING
+
+
+def test_checkout_requested_tracks_the_checkout_flow(menu):
+    session = OrderSession(menu)
+    session.add(item_id="margherita", quantity=4, options={"size": "large"})
+    with pytest.raises(OrderError):
+        session.review(turn=1)  # over the limit, but the customer did ask to check out
+    assert session.checkout_requested is True
+    session.clear()
+    assert session.checkout_requested is False
+
+
+# ------------------------------------------------------------------ partial update (split)
+def test_update_some_units_splits_the_line(menu):
+    cart = Cart(menu)
+    line = cart.add("classic_burger", quantity=3, options={"size": "large"})
+    changed = cart.update(
+        line.line_id, units=1, add_extras=["cheese", "bacon", "avocado", "extra_patty"]
+    )
+    assert changed.line_id != line.line_id
+    assert changed.quantity == 1
+    assert cart.get(line.line_id).quantity == 2
+    assert cart.get(line.line_id).extras == ()
+    assert [describe_line(menu, ln) for ln in cart.lines] == [
+        "2x Large Classic Burger",
+        "Large Classic Burger with cheese, bacon, avocado and extra patty",
+    ]
+    assert cart.total == Decimal("39.00")  # 2 x 10.50 + 18.00
+
+
+def test_update_with_units_equal_to_quantity_changes_the_whole_line(menu):
+    cart = Cart(menu)
+    line = cart.add("fries", quantity=2)
+    changed = cart.update(line.line_id, units=2, options={"size": "large"})
+    assert changed.line_id == line.line_id
+    assert len(cart.lines) == 1
+    assert changed.options["size"] == "large"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"units": 5, "add_extras": ["parmesan"]}, "units must be between 1 and 2"),
+        ({"units": 1, "quantity": 3}, "either units"),
+        ({"units": 1, "options": {"size": "huge"}}, "Invalid size"),
+    ],
+)
+def test_invalid_split_leaves_the_cart_untouched(menu, kwargs, message):
+    cart = Cart(menu)
+    line = cart.add("fries", quantity=2)
+    with pytest.raises(OrderError, match=message):
+        cart.update(line.line_id, **kwargs)
+    assert cart.lines == [line]
+    assert cart.add("fries").line_id == line.line_id + 1  # no line id was consumed

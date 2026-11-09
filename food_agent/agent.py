@@ -21,7 +21,7 @@ from typing import Any
 
 import structlog
 
-from food_agent.cart import OrderPhase, OrderSession
+from food_agent.cart import OrderError, OrderPhase, OrderSession, describe_line
 from food_agent.config import Settings
 from food_agent.llm import LLMClient, LLMError, MistralLLM
 from food_agent.mcp_client import McpOrderSubmitter, OrderSubmitter
@@ -133,6 +133,8 @@ class FoodOrderAgent:
         self._history.append({"role": "user", "content": text})
         external_calls: list[dict[str, Any]] = []
         events: set[str] = set()
+        touched_lines: list[int] = []
+        removed_lines: list[str] = []
         reply: str | None = None
 
         for _ in range(self.settings.max_tool_iterations):
@@ -165,6 +167,8 @@ class FoodOrderAgent:
             for tc in response.tool_calls:
                 result = self._tools.execute(tc.name, tc.arguments, turn=self._turn)
                 events.update(result.events)
+                touched_lines.extend(result.touched_lines)
+                removed_lines.extend(result.removed_lines)
                 if result.external_call is not None:
                     external_calls.append(result.external_call)
                 trace.add_step(
@@ -189,7 +193,9 @@ class FoodOrderAgent:
             reply = STUCK_REPLY.format(summary=self.session.cart.summary_text())
 
         assert reply is not None  # every branch above sets it  # noqa: S101
-        reply = self._enforce_reply_invariants(reply, events, external_calls)
+        reply = self._enforce_reply_invariants(
+            reply, events, external_calls, touched_lines, removed_lines
+        )
         self._history.append({"role": "assistant", "content": reply})
         return self._finish(trace, reply, external_calls)
 
@@ -241,22 +247,62 @@ class FoodOrderAgent:
         return self._history[start:]
 
     def _enforce_reply_invariants(
-        self, reply: str, events: set[str], external_calls: list[dict[str, Any]]
+        self,
+        reply: str,
+        events: set[str],
+        external_calls: list[dict[str, Any]],
+        touched_lines: list[int] | None = None,
+        removed_lines: list[str] | None = None,
     ) -> str:
         """Deterministic guards on facts the customer must get exactly right."""
         awaiting = self.session.phase is OrderPhase.AWAITING_CONFIRMATION
+        summary_shown = False
         if "reviewed" in events and awaiting and "submit_attempted" not in events:
             summary = self.session.cart.summary_text()
             total = self.session.cart.snapshot()["total"]
             if total not in reply:
                 log.warning("reply.guard", guard="review_total_missing")
                 reply = f"{reply}\n\n{summary}\nReady to submit?"
+                summary_shown = True
+        if not summary_shown:
+            reply = self._state_multi_unit_changes(reply, touched_lines or [], removed_lines or [])
         if "submitted" in events:
             order_id = str(external_calls[-1]["result"].get("order_id", ""))
             if order_id and order_id not in reply:
                 log.warning("reply.guard", guard="order_id_missing")
                 reply = f"{reply}\nOrder #{order_id}."
         return reply
+
+    def _state_multi_unit_changes(
+        self, reply: str, touched_lines: list[int], removed_lines: list[str]
+    ) -> str:
+        """Changes to multi-unit lines must be stated exactly as they now are.
+
+        "One of them" vs "all of them" is where a paraphrased confirmation goes wrong,
+        e.g. "Updated one of the burgers" after all three were changed. If the reply
+        does not contain the current description of each such line, append it. The
+        check uses the cart *after* the turn, so later changes in the same turn win.
+        """
+        lowered = reply.lower()
+        missing: list[str] = []
+        for line_id in dict.fromkeys(touched_lines):  # dedupe, keep order
+            try:
+                line = self.session.cart.get(line_id)
+            except OrderError:
+                continue  # removed later in the same turn
+            desc = describe_line(self.menu, line)
+            if desc.lower() not in lowered:
+                missing.append(desc)
+        gone = [d for d in dict.fromkeys(removed_lines) if d.lower() not in lowered]
+        if not missing and not gone:
+            return reply
+        log.warning("reply.guard", guard="multi_unit_change_unstated")
+        notes = []
+        if gone:
+            notes.append(f"Removed: {', '.join(gone)}.")
+        if missing:
+            notes.append(f"Your order now has: {'; '.join(missing)}.")
+        return f"{reply}\n({' '.join(notes)})"
 
     def _finish(
         self, trace: TurnTrace, reply: str, external_calls: list[dict[str, Any]]

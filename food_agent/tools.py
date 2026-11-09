@@ -59,10 +59,29 @@ class UpdateItemArgs(_Args):
     )
     add_extras: list[str] | None = None
     remove_extras: list[str] | None = None
+    units: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_LINE_QUANTITY,
+        description=(
+            "Apply the change to only this many units of a multi-unit line; the line is "
+            "split. E.g. line '3x Large Classic Burger' + 'add cheese to one of them' -> "
+            "units=1, add_extras=['cheese']. Omit to change every unit on the line."
+        ),
+    )
 
 
-class LineIdArgs(_Args):
-    line_id: int
+class RemoveItemArgs(_Args):
+    line_id: int = Field(description="line_id of the order line to remove from.")
+    quantity: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_LINE_QUANTITY,
+        description=(
+            "How many units to remove from the line. Omit to remove the whole line. "
+            "E.g. line '3x Large Classic Burger' + 'remove one of them' -> quantity=1."
+        ),
+    )
 
 
 class SpecialInstructionsArgs(_Args):
@@ -100,10 +119,16 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         "update_item",
         "Change an existing line (quantity, options, extras). Use for 'make it large', "
-        "'remove the bacon', 'two of those'.",
+        "'remove the bacon', 'two of those'. To change only SOME units of a multi-unit line "
+        "('one of them with cheese'), pass units.",
         UpdateItemArgs,
     ),
-    ToolSpec("remove_item", "Remove a line from the order entirely.", LineIdArgs),
+    ToolSpec(
+        "remove_item",
+        "Remove items from the order. With quantity, removes only that many units of the "
+        "line ('remove one of the large burgers'); without it, removes the whole line.",
+        RemoveItemArgs,
+    ),
     ToolSpec("clear_order", "Remove every line (customer wants to start over).", NoArgs),
     ToolSpec("view_order", "Return the current order with line ids and totals.", NoArgs),
     ToolSpec(
@@ -160,6 +185,11 @@ class ToolResult:
     content: dict[str, Any]
     external_call: dict[str, Any] | None = None  # set when an MCP tool was actually invoked
     events: list[str] = field(default_factory=list)  # e.g. "reviewed", "submitted"
+    # Changes the reply must state exactly (multi-unit lines, where "one of them" vs "all of
+    # them" is easy to get wrong): line ids whose current description must appear, and
+    # descriptions of multi-unit lines removed entirely.
+    touched_lines: list[int] = field(default_factory=list)
+    removed_lines: list[str] = field(default_factory=list)
 
     def to_message_content(self) -> str:
         return json.dumps(self.content, ensure_ascii=False, default=str)
@@ -201,38 +231,99 @@ class ToolExecutor:
     def _line(self, line: Any) -> dict[str, Any]:
         return {"line_id": line.line_id, "description": describe_line(self._session.menu, line)}
 
+    def _changed(
+        self,
+        content: dict[str, Any],
+        turn: int,
+        *,
+        touched: list[int] | None = None,
+        removed: list[str] | None = None,
+    ) -> ToolResult:
+        """Result of a successful cart change.
+
+        If the customer is already checking out, re-run the review right away and
+        attach it, so the model's next "Ready to submit?" is backed by a real,
+        current review (brief example 2: "Make the cola large" -> new total ->
+        "Ready to submit?"). If the cart still fails validation (e.g. over the limit)
+        the error is attached instead and the order stays in the building phase.
+        """
+        content["order"] = self._order()
+        result = ToolResult(content, touched_lines=touched or [], removed_lines=removed or [])
+        if not self._session.checkout_requested:
+            return result
+        try:
+            summary = self._session.review(turn)
+        except OrderError as exc:
+            content["review"] = {
+                "ok": False,
+                "error": str(exc),
+                "next_step": "Tell the customer what still needs to change before submitting.",
+            }
+            return result
+        content["review"] = {
+            "ok": True,
+            "summary": summary,
+            "total": self._order()["total"],
+            "next_step": "Confirm the change, present this summary and total, then ask the "
+            "customer to confirm.",
+        }
+        result.events.append("reviewed")
+        return result
+
     # -- handlers
-    def _add_item(self, args: AddItemArgs, _turn: int) -> ToolResult:
+    def _add_item(self, args: AddItemArgs, turn: int) -> ToolResult:
         line = self._session.add(
             item_id=args.item_id, quantity=args.quantity, options=args.options, extras=args.extras
         )
-        return ToolResult({"ok": True, "added": self._line(line), "order": self._order()})
+        return self._changed({"ok": True, "added": self._line(line)}, turn)
 
-    def _update_item(self, args: UpdateItemArgs, _turn: int) -> ToolResult:
+    def _update_item(self, args: UpdateItemArgs, turn: int) -> ToolResult:
+        before = self._session.cart.get(args.line_id).quantity
         line = self._session.update(
             args.line_id,
             quantity=args.quantity,
             options=args.options,
             add_extras=args.add_extras,
             remove_extras=args.remove_extras,
+            units=args.units,
         )
-        return ToolResult({"ok": True, "updated": self._line(line), "order": self._order()})
+        content: dict[str, Any] = {"ok": True, "updated": self._line(line)}
+        touched: list[int] = []
+        if line.line_id != args.line_id:  # split: some units changed, the rest are untouched
+            unchanged = self._session.cart.get(args.line_id)
+            content["unchanged_on_original_line"] = self._line(unchanged)
+            content["note"] = (
+                f"Only {line.quantity} of {before} changed; the line was split. In the "
+                "confirmation, mention both the changed and the unchanged items."
+            )
+            touched = [args.line_id, line.line_id]
+        elif max(before, line.quantity) > 1:
+            touched = [line.line_id]
+        return self._changed(content, turn, touched=touched)
 
-    def _remove_item(self, args: LineIdArgs, _turn: int) -> ToolResult:
-        line = self._session.remove(args.line_id)
-        return ToolResult({"ok": True, "removed": self._line(line), "order": self._order()})
+    def _remove_item(self, args: RemoveItemArgs, turn: int) -> ToolResult:
+        removed, remaining = self._session.remove(args.line_id, args.quantity)
+        content: dict[str, Any] = {
+            "ok": True,
+            "removed_quantity": removed.quantity,
+            "removed": self._line(removed),
+            "remaining_on_line": self._line(remaining) if remaining else None,
+        }
+        if remaining is not None:
+            return self._changed(content, turn, touched=[remaining.line_id])
+        removed_text = [content["removed"]["description"]] if removed.quantity > 1 else []
+        return self._changed(content, turn, removed=removed_text)
 
     def _clear_order(self, _args: NoArgs, _turn: int) -> ToolResult:
-        for line in self._session.cart.lines:
-            self._session.remove(line.line_id)
+        self._session.clear()
         return ToolResult({"ok": True, "order": self._order()})
 
     def _view_order(self, _args: NoArgs, _turn: int) -> ToolResult:
         return ToolResult({"ok": True, "order": self._order()})
 
-    def _set_special_instructions(self, args: SpecialInstructionsArgs, _turn: int) -> ToolResult:
+    def _set_special_instructions(self, args: SpecialInstructionsArgs, turn: int) -> ToolResult:
         text = self._session.set_special_instructions(args.text)
-        return ToolResult({"ok": True, "special_instructions": text, "order": self._order()})
+        return self._changed({"ok": True, "special_instructions": text}, turn)
 
     def _review_order(self, _args: NoArgs, turn: int) -> ToolResult:
         summary = self._session.review(turn)

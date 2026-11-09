@@ -163,11 +163,29 @@ The cart is kept, and the next turn works normally. The tool loop is capped at
   turns, which is what makes "remove the bacon" reliable.
 - **Reply guards.** If the model reviews the order but leaves the exact total out of its reply, or
   confirms a submission without the order id, code appends the canonical summary or id. What the
-  customer pays is never left to the model.
+  customer pays is never left to the model. Changes to **multi-unit lines** get the same
+  treatment: if the reply doesn't contain the line's current description (e.g.
+  `2x Large Classic Burger`), code appends it. A paraphrase like "updated one of the burgers"
+  after all three were changed is exposed in that same reply, not discovered at checkout.
+  Single-unit changes are left to the model, where paraphrasing is harmless.
 - **The prompt sets conversational policy:** sensible defaults ("burger" means the classic burger,
   "coke" means a cola soda); use defaults silently; ask only when an option has no default (the
   milkshake flavor); confirm each change in one line; review before submitting.
 - Tool errors are written to be acted on, and are returned as data so the model can recover.
+- **Tools match how people talk: lines split when only some units change.** A cart line is "N
+  identical units", but customers talk about subsets: "remove one of them", "add all extras to
+  one of the three". `remove_item(quantity=…)` takes units off a line, and
+  `update_item(units=…)` applies a change to only that many units by splitting the line
+  (`3x Large Classic Burger` becomes `2x Large Classic Burger` plus
+  `Large Classic Burger with …`). The arithmetic is in code and a failed split changes nothing.
+  Without this, a small model had to chain two calls to express "one of them", and it usually
+  changed or deleted the whole line instead.
+- **Changes made during checkout are re-reviewed automatically.** Once the customer has asked to
+  check out, every later change (add, update, remove, special instructions) re-runs the review and
+  attaches it to the tool result, with either a fresh summary and total, or the reason the order
+  still can't go through (for example, still over the limit). "Ready to submit?" is therefore
+  always backed by a current review, and the customer's next "yes" submits directly. This is the
+  flow in brief example 2 ("Make the cola large" → new total → "Ready to submit?").
 
 ### 6. Treating user text as untrusted
 - User text only ever goes in `user` messages. It is never interpolated into instructions.
@@ -211,7 +229,31 @@ jq -c '{turn, user_message, assistant_message, usage}' logs/conversations/conv_*
   is opened only when needed. The cost is one handshake per order. In return `send()` stays
   synchronous, there is no background event loop to manage, and per-request headers are trivial.
 
-### 9. Smaller choices
+### 9. What is enforced in code vs. interpreted by the model
+The agent is deliberately **strict about the order and relaxed about the conversation**.
+
+| Enforced in code (cannot be talked around) | Interpreted by the model (best effort) |
+| --- | --- |
+| Only menu items, options and extras; defaults resolved explicitly | Mapping phrases to items ("coke", "the big one", "same again") |
+| Prices, totals, the $50 limit (at review **and** before submit) | Which line a change refers to; asking when it is ambiguous |
+| Submit only after a review in an earlier turn, on an unchanged cart | Whether the customer's reply means "yes" |
+| Submit payload built from the cart; the model passes no arguments | Tone, brevity, and staying on topic |
+| Quantity arithmetic for partial removals and line splits | Choosing "some units" vs. "the whole line" from the wording |
+| Exact reviewed total, order id, and multi-unit changes present in the reply | |
+
+**Known limitations, accepted on purpose:**
+- The prompt-level rules (stay on topic, ignore "new instructions") can be bypassed by a
+  determined user. The consequence is limited to an odd reply or a wrong change *to their own
+  cart*, which they see in the next confirmation. Nothing unvalidated or unreviewed can be
+  submitted. More guardrails would mostly make normal conversations stiffer.
+- "Yes" detection is the model's call. A model that reads an ambiguous reply as confirmation can
+  submit, but only the exact cart and total the customer was just shown.
+- Misreading intent (e.g. "remove the large" when there are three) is mitigated by the tool
+  design, the prompt rule and the multi-unit reply guard, not eliminated. The guard means a wrong
+  change is always *visible* in the reply, so the customer can correct it. The evals on the roadmap
+  are how these regressions get caught against the real model.
+
+### 10. Smaller choices
 - `Decimal` for money end to end. Defaults are resolved when an item is added, so the cart and the
   payload are explicit (`{"size": "large", "patty": "beef"}`).
 - Line ids are stable and never reused, so "line 2" means the same thing all conversation.
@@ -232,16 +274,18 @@ make fmt        # auto-format + autofix
 - **ruff**, with a broad rule set (pyflakes, bugbear, bandit `S`, pylint `PL`, `TRY`, `PERF`,
   `ANN`, `T20`, ...); see `pyproject.toml`. **ty** type-checks the package, the tests and the
   entry points.
-- **pytest**, 63 tests, offline and deterministic (about 1 s):
+- **pytest**, 83 tests, offline and deterministic (about 1 s):
   - `test_menu.py`: parsing and integrity errors.
   - `test_cart.py`: the brief's totals ($11.50, $22.25), validation messages, normalisation
-    (`"Extra Hot"` → `extra_hot`, Unicode `jalapeños`), sanitisation, and the confirmation guard.
+    (`"Extra Hot"` → `extra_hot`, Unicode `jalapeños`), sanitisation, partial removal, line splitting, and the confirmation guard.
   - `test_mcp.py`: every outcome over real Streamable HTTP against the mock: forced failures,
     schema errors, missing email, unreachable server, recovery on retry.
   - `test_agent.py`: the full loop with a scripted LLM. Covers brief example 1 end to end,
     submit-in-same-turn and submit-without-review blocked, an LLM-supplied payload rejected, busy
     kitchen then retry, self-correction after tool errors, malformed tool calls, LLM outage,
-    bounded loop, reply guards, state injection, history trimming, and trace contents.
+    bounded loop, reply guards, state injection, history trimming, trace contents, and a replay of a
+    real over-limit conversation ("remove the one large" → 2 left; re-review → "yes" submits),
+    "add all extras to one of the three" splitting the line, and the multi-unit reply guard.
 - **CI**: GitHub Actions runs the same gates on every push and PR.
 
 The scripted LLM tests the **plumbing and the guarantees**. Whether the real model makes good

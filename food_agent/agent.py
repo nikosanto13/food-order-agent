@@ -10,7 +10,8 @@ One ``send()`` call = one user turn:
 4. One trace record per turn, plus structured events along the way.
 
 The cart (``OrderSession``) is the source of truth, not the chat history; the
-current state is re-injected into the system prompt on every call. That lets
+current state is re-sent with every call (appended to the latest user message,
+see ``prompts.py``). That lets
 the history be trimmed aggressively (cost) without the model losing track of
 the order (quality).
 """
@@ -36,13 +37,15 @@ from food_agent.observability import (
     new_conversation_id,
 )
 from food_agent.pricing import estimate_cost, pricing_for
-from food_agent.prompts import build_static_prompt, build_system_message
+from food_agent.prompts import build_static_prompt, build_system_message, with_order_state
 from food_agent.tools import TOOL_SCHEMAS, ToolExecutor
 
 logger = structlog.get_logger(__name__)
 
 EMPTY_INPUT_REPLY = "Sorry, I didn't catch that. What would you like to order?"
-LLM_DOWN_REPLY = "Sorry, I'm having trouble right now. Your order is saved; please try again in a moment."
+LLM_DOWN_REPLY = (
+    "Sorry, I'm having trouble right now. Your order is saved; please try again in a moment."
+)
 STUCK_REPLY = "Sorry, I got a bit confused there. Here's your order so far:\n{summary}"
 
 
@@ -231,11 +234,12 @@ class FoodOrderAgent:
         return self._finish(trace, reply, external_calls)
 
     def _call_llm(self, trace: TurnTrace) -> Any:
+        # Fixed system prompt first, live state last: see food_agent/prompts.py (caching).
         messages = [
-            build_system_message(
-                self._static_prompt, self.session.cart.snapshot(), self.session.phase.value
+            build_system_message(self._static_prompt),
+            *with_order_state(
+                self._trimmed_history(), self.session.cart.snapshot(), self.session.phase.value
             ),
-            *self._trimmed_history(),
         ]
         response = self.llm.complete(messages, TOOL_SCHEMAS)
         # Price by the model we asked for: the response may echo a dated snapshot id.
@@ -278,7 +282,7 @@ class FoodOrderAgent:
         """Keep the last N messages, cut at a user-message boundary.
 
         Cutting elsewhere could orphan a tool result from its tool call, which
-        providers reject. The cart lives in the system prompt, so old turns are
+        providers reject. The live cart is re-sent with every call, so old turns are
         expendable.
         """
         limit = self.settings.max_history_messages

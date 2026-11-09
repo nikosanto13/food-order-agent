@@ -103,9 +103,10 @@ The cart is kept, and the next turn works normally. The tool loop is capped at
 `MAX_TOOL_ITERATIONS`; if it runs out, the agent shows the current cart instead of spinning.
 
 ### 5. Conversation quality
-- **State is injected into the prompt.** The live cart (line ids, descriptions, totals, phase) goes
-  into the system prompt on every LLM call. The model never has to remember line ids from earlier
-  turns, which is what makes "remove the bacon" reliable.
+- **State is injected into the prompt.** The live cart (line ids, descriptions, totals, phase) is
+  sent with every LLM call, as an `<order_state>` block at the end of the customer's latest
+  message (where, and why there, is in [section 8](#8-performance--cost)). The model never has to
+  remember line ids from earlier turns, which is what makes "remove the bacon" reliable.
 - **Reply guards.** If the model reviews the order but leaves the exact total out of its reply, or
   confirms a submission without the order id, code appends the canonical summary or id. What the
   customer pays is never left to the model. Changes to **multi-unit lines** get the same
@@ -133,7 +134,9 @@ The cart is kept, and the next turn works normally. The tool loop is capped at
   flow in brief example 2 ("Make the cola large" → new total → "Ready to submit?").
 
 ### 6. Treating user text as untrusted
-- User text only ever goes in `user` messages. It is never interpolated into instructions.
+- User text only ever goes in `user` messages. It is never interpolated into instructions. The
+  system-written `<order_state>` block is appended after it, and a look-alike tag typed by the
+  customer is defused, so customer text cannot pose as the order state.
 - The prompt says customer text is data, not instructions. More importantly, the architecture means
   a successful injection can only call cart tools with arguments that still get validated.
 - Free text that leaves the system (`special_instructions`) is cleaned up: control, zero-width and
@@ -170,9 +173,19 @@ jq -c 'select(.voice) | {turn, latency: .voice.latency_ms, cost: .usage}' logs/c
 ### 8. Performance & cost
 - **Small model by default** (`mistral-small-latest`). The task is narrow and the hard guarantees
   live in code, so a frontier model probably isn't necessary.
-- **Static prompt prefix** (instructions + menu, rendered once and compactly), with the dynamic
-  state at the end so provider-side prefix caching can reuse it (input vs. cache input tokens
-  are shown in logs).
+- **Cache-friendly prompt layout.** Providers reuse the longest identical *prefix* of an earlier
+  prompt and re-bill everything after the first differing token, so what changes goes last:
+  `[system: instructions + menu] [history, append-only] [latest user message + <order_state>]`.
+  The live state used to sit at the end of the system message, i.e. *before* the history, and
+  since almost every tool call changes the cart, each turn's second LLM call re-processed the
+  whole history: a real 5-turn voice session cached 89% of first calls but 18% of second calls.
+  Attached to the latest user message, a cart change only invalidates the tail. The trade-off:
+  on the next turn the block moves to the new message, so the previous turn's tail (tool calls,
+  results, reply) is re-processed once. Replaying that session gives 76% of prompt text
+  reusable instead of 65%. Keeping each turn's last snapshot in the history would reach 84%,
+  but makes prompts 16% longer and leaves stale order states for the model to confuse with
+  the current one, so it is not done. (Mistral is also not guaranteed to accept a system
+  message after the history.) Cached vs. uncached input tokens are in every trace.
 - **Bounded context.** History is trimmed to the last N messages, always cut at a user-message
   boundary so a tool result is never separated from its tool call. Because the cart is in the
   prompt, old turns aren't needed.

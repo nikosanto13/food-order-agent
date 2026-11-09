@@ -29,7 +29,14 @@ from typing import Any, TextIO
 
 import structlog
 
-_SENSITIVE_KEYS = {"api_key", "authorization", "mistral_api_key", "x-applicant-email", "password"}
+_SENSITIVE_KEYS = {
+    "api_key",
+    "authorization",
+    "mistral_api_key",
+    "elevenlabs_api_key",
+    "x-applicant-email",
+    "password",
+}
 _log_file: TextIO | None = None
 
 

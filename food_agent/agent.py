@@ -79,7 +79,7 @@ class FoodOrderAgent:
             max_attempts=self.settings.mcp_max_attempts,
             force_failure=self.settings.mcp_force_failure,
         )
-        self._static_prompt = build_static_prompt(self.menu)
+        self._static_prompt = build_static_prompt(self.menu, self.settings.reply_style)
         self._traces = ConversationTraceWriter(self.settings.log_dir)
         self.reset(conversation_id)
 

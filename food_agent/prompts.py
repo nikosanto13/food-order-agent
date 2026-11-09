@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from food_agent.menu import Menu
 
@@ -58,9 +58,22 @@ Short, friendly, plain text (no markdown tables or headings). Money as $X.XX.\
 """
 
 
-def build_static_prompt(menu: Menu) -> str:
+_VOICE_INSTRUCTIONS = """\
+# Voice
+This is a spoken conversation. Customer messages are speech-to-text transcripts and may \
+contain recognition errors ("margarita" for margherita, "for" for four): match them to the \
+menu by sound, and ask when a mistake would change the order. Your replies are read aloud \
+and cannot be seen: keep them to one or two short sentences, no lists, line ids, symbols \
+or emoji. When reviewing the order, still state every item and the exact total.\
+"""
+
+
+def build_static_prompt(menu: Menu, reply_style: Literal["text", "voice"] = "text") -> str:
     header = "# Menu (id (name): base price; option choices with price deltas)"
-    return f"{_INSTRUCTIONS}\n\n{header}\n{menu.to_prompt()}"
+    instructions = _INSTRUCTIONS
+    if reply_style == "voice":
+        instructions = f"{_INSTRUCTIONS}\n\n{_VOICE_INSTRUCTIONS}"
+    return f"{instructions}\n\n{header}\n{menu.to_prompt()}"
 
 
 def build_system_message(

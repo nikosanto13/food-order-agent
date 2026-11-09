@@ -34,6 +34,22 @@ Useful flags: `--verbose` (stream JSON logs to stderr), `--force-failure kitchen
 (failure drills via `X-Demo-Force-Failure`), `--busy-rate 0.3` (mock's random busy rate).
 REPL commands: `/cart`, `/reset`, `/trace` (path of this conversation's trace), `/quit`.
 
+### Voice mode (optional)
+
+Talk to the agent instead of typing: ElevenLabs Scribe transcribes you, the same agent handles
+the order, and ElevenLabs Flash speaks the reply.
+
+```bash
+uv sync --extra voice         # optional extra: elevenlabs + sounddevice
+# set ELEVENLABS_API_KEY in .env
+python main.py --voice --local
+```
+
+Press **Enter** to start talking and **Enter** again when you're done. You can still type a
+message (or a `/command`) instead. Ctrl+C while the agent speaks stops the audio, not the
+session. Without the extra, everything else installs and runs as before; `--voice` just tells
+you what to install. See [design notes](docs/ARCHITECTURE.md#11-voice-an-optional-front-end).
+
 ### Programmatic API
 
 ```python
@@ -73,6 +89,11 @@ and has a seedable random "kitchen busy" rate.
 | `MCP_FORCE_FAILURE` | — | `kitchen_busy` / `server_error` drill header |
 | `MAX_TOOL_ITERATIONS` | `8` | LLM↔tool steps per user turn |
 | `MAX_HISTORY_MESSAGES` | `40` | Chat history sent to the LLM |
+| `ELEVENLABS_API_KEY` | — | Voice mode credentials |
+| `ELEVENLABS_VOICE_ID` | `JBFqnCBsd6RMkjVDRZzb` | TTS voice |
+| `ELEVENLABS_TTS_MODEL`, `ELEVENLABS_STT_MODEL` | `eleven_flash_v2_5`, `scribe_v2` | Speech models |
+| `VOICE_STT_KEYTERMS` | `true` | Bias transcription towards menu words (billed extra) |
+| `VOICE_MAX_RECORD_S` | `30` | Longest utterance kept |
 | `LOG_LEVEL`, `LOG_DIR`, `LOG_TO_STDERR` | `INFO`, `logs`, `false` | Observability |
 
 ---
@@ -97,18 +118,21 @@ code vs. left to the model.
 make check      # format, linting, typechecking, pytest
 make fmt        # auto-format + autofix
 make audit      # scan locked dependencies for known vulnerabilities (needs network)
+make test-live  # tests marked `live`: real LLM / MCP / ElevenLabs (spends credits)
 ```
 
 Linting is **ruff** with a broad rule set (see `pyproject.toml`), type-checking is **ty**, and the
 **pytest** suite is offline and deterministic (about 1 s). Dependencies are audited with
 **uv audit** against OSV; accepted findings go in `[tool.uv.audit]`. GitHub Actions runs the same
-gates on every push and PR, plus a weekly audit.
+gates on every push and PR (once with all extras, once without, to keep voice optional), plus a
+weekly audit.
 
 ---
 
 ## Future steps
 
-- **Voice** (next): STT → `agent.send()` → TTS (ElevenLabs), with shorter, speech-friendly replies.
+- **Voice, streaming**: realtime STT with server-side turn detection (no push-to-talk), stream
+  the LLM reply into TTS sentence by sentence, and let the customer interrupt the agent.
 - **Evals**: scripted multi-turn scenarios run against the real LLM and the mock server. The
   assertions are deterministic: the final submitted payload, no submission without confirmation,
   the right clarifying questions. The report covers pass rate, tokens, cost and p50/p95 latency per

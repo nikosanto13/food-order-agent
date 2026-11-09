@@ -18,6 +18,12 @@ dependencies = [
     "uvicorn>=0.54.0",
 ]
 
+[project.optional-dependencies]
+voice = [
+    "elevenlabs>=2.77.0",
+    "sounddevice>=0.5.6",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
@@ -83,8 +89,8 @@ possibly-unresolved-reference = "error"
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not live'"  # `pytest -m live` runs them
 markers = [
-    "live: hits real external services (LLM / prod MCP); deselected by default",
+    "live: hits real external services (LLM / prod MCP / ElevenLabs); deselected by default",
 ]
 filterwarnings = ["error::DeprecationWarning:food_agent.*"]

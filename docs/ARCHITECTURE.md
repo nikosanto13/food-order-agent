@@ -17,6 +17,7 @@ How the Food Order Agent is put together and why. For setup and usage, see the
   - [Performance & cost](#8-performance--cost)
   - [What is enforced in code vs. interpreted by the model](#9-what-is-enforced-in-code-vs-interpreted-by-the-model)
   - [Smaller choices](#10-smaller-choices)
+  - [Voice: an optional front-end](#11-voice-an-optional-front-end)
 
 ---
 
@@ -44,6 +45,7 @@ user text ─►│ pre-checks ─► LLM ◄──► ToolExecutor ──► Or
 | `food_agent/mcp_client.py` | MCP client: outcome classification, retry policy, idempotency |
 | `food_agent/mock_server.py` | Local MCP server with the same contract (dev + tests) |
 | `food_agent/observability.py` | structlog JSON config, redaction, per-turn trace records |
+| `food_agent/voice/` | Optional voice front-end (`--extra voice`): push-to-talk channel, ElevenLabs STT/TTS, audio devices, speakable text |
 | `agent.py`, `main.py` | Required entry points |
 
 ---
@@ -210,3 +212,39 @@ The agent is deliberately **strict about the order and relaxed about the convers
   Internal cart tool calls go in the trace.
 - The mock server reuses the agent's menu module. That's fine for a mock: the provided server is
   the real oracle, and contract tests against it come next.
+
+### 11. Voice: an optional front-end
+```
+Enter ─► mic (16 kHz PCM) ─► Scribe v2 STT ─► agent.send() ─► speakable text ─► Flash v2.5 TTS ─► speaker
+         push-to-talk         + menu keyterms   (unchanged)     ($11.50 → "11 dollars 50")   streamed PCM
+```
+- **A channel, not a new agent.** `main.py` reads from and replies to a two-method channel
+  (`read()` / `reply()`); voice is a second implementation next to the keyboard. Cart, guards,
+  confirmation and MCP handling are the same code, so every guarantee above holds when speaking.
+  The only agent-side change is `REPLY_STYLE=voice`, which appends a short prompt section: input
+  is a transcript (match misheard words to the menu by sound, ask when it matters), and replies
+  are one or two speakable sentences that still state every item and the exact total at review.
+- **Optional by construction.** `elevenlabs` and `sounddevice` live in the `voice` extra and are
+  imported only when a speech client or audio device is created. A missing extra, a missing
+  PortAudio library or a missing key becomes `VoiceUnavailableError` with the fix in the
+  message. `main.py` imports the voice package only under `--voice`. CI runs the suite with
+  and without the extras.
+- **Recognition is biased towards the menu.** Item names, option choices and extras are sent as
+  Scribe *keyterms* (derived from `menu.yaml`, so never stale), which is what turns
+  "margarita" into "margherita". `no_verbatim` drops fillers and false starts; audio-event tags
+  are off, so the LLM sees only words. Keyterms cost extra, so `VOICE_STT_KEYTERMS=false` turns
+  them off.
+- **Speakable text is deterministic.** Flash models read text literally, and the reply guards
+  need the exact `$11.50` in the reply, so the model keeps writing for the screen and code
+  rewrites a copy for the ear: money in words, order ids spelled out, `15-20` → "15 to 20",
+  `2x` → "2", bullets and markup flattened into sentences. The screen shows the exact text.
+- **Low latency where it is cheap.** Flash v2.5 (the lowest-latency TTS) streams raw PCM, which
+  is played as it arrives (no MP3 decoding, no ffmpeg), re-chunked on sample boundaries so a
+  network split never garbles the audio. Logs record STT latency, time to first audio and total
+  playback time per turn (`voice.stt`, `voice.tts`).
+- **Speech failures never end the order.** A failed or empty transcription asks the customer to
+  try again (or type); a failed synthesis falls back to the printed reply; Ctrl+C stops the
+  audio, not the session.
+- **Push-to-talk over voice activity detection**: explicit turns are robust to background noise
+  and need no tuning, which suits a terminal demo. Realtime STT with server-side turn detection
+  and barge-in is the next step (see the [roadmap](../README.md#future-steps)).

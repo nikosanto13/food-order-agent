@@ -1,0 +1,281 @@
+"""``FoodOrderAgent``: the conversational loop.
+
+One ``send()`` call = one user turn:
+
+1. Cheap pre-checks (empty / oversized input) answered without an LLM call.
+2. Bounded tool-calling loop: LLM -> tool calls -> tool results -> LLM ... until the
+   model answers in plain text or the step budget runs out.
+3. Deterministic post-checks on the reply (the reviewed total and the order id
+   must appear verbatim), so a model slip cannot misstate what the customer pays.
+4. One trace record per turn, plus structured events along the way.
+
+The cart (``OrderSession``) is the source of truth, not the chat history; the
+current state is re-injected into the system prompt on every call. That lets
+the history be trimmed aggressively (cost) without the model losing track of
+the order (quality).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import structlog
+
+from food_agent.cart import OrderPhase, OrderSession
+from food_agent.config import Settings
+from food_agent.llm import LLMClient, LLMError, MistralLLM
+from food_agent.mcp_client import McpOrderSubmitter, OrderSubmitter
+from food_agent.menu import Menu, load_menu
+from food_agent.observability import (
+    ConversationTraceWriter,
+    TurnTrace,
+    configure_logging,
+    new_conversation_id,
+)
+from food_agent.prompts import build_static_prompt, build_system_message
+from food_agent.tools import TOOL_SCHEMAS, ToolExecutor
+
+log = structlog.get_logger(__name__)
+
+EMPTY_INPUT_REPLY = "Sorry, I didn't catch that. What would you like to order?"
+LLM_DOWN_REPLY = (
+    "Sorry, I'm having trouble right now. Your order is saved; please try again in a moment."
+)
+STUCK_REPLY = "Sorry, I got a bit confused there. Here's your order so far:\n{summary}"
+
+
+class FoodOrderAgent:
+    """Conversational food-ordering agent.
+
+    All collaborators are injectable (LLM, order submitter, menu, settings) so the
+    agent runs offline in tests with a scripted LLM and the local MCP server.
+    """
+
+    def __init__(
+        self,
+        *,
+        llm: LLMClient | None = None,
+        submitter: OrderSubmitter | None = None,
+        menu: Menu | None = None,
+        settings: Settings | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
+        self.settings = settings or Settings()
+        if not structlog.is_configured():
+            configure_logging(
+                level=self.settings.log_level,
+                log_dir=self.settings.log_dir,
+                to_stderr=self.settings.log_to_stderr,
+            )
+        self.menu = menu or load_menu()
+        self.llm = llm or self._default_llm()
+        self.submitter = submitter or McpOrderSubmitter(
+            self.settings.mcp_url,
+            applicant_email=self.settings.applicant_email,
+            timeout_s=self.settings.mcp_timeout_s,
+            max_attempts=self.settings.mcp_max_attempts,
+            force_failure=self.settings.mcp_force_failure,
+        )
+        self._static_prompt = build_static_prompt(self.menu)
+        self._traces = ConversationTraceWriter(self.settings.log_dir)
+        self.reset(conversation_id)
+
+    def _default_llm(self) -> LLMClient:
+        key = self.settings.mistral_api_key
+        if key is None:
+            raise RuntimeError("MISTRAL_API_KEY is not set (see .env.example).")
+        return MistralLLM(
+            key.get_secret_value(),
+            model=self.settings.mistral_model,
+            temperature=self.settings.llm_temperature,
+            max_tokens=self.settings.llm_max_output_tokens,
+            timeout_s=self.settings.llm_timeout_s,
+        )
+
+    def reset(self, conversation_id: str | None = None) -> None:
+        """Start a new conversation (fresh cart, history and conversation id)."""
+        self.conversation_id = conversation_id or new_conversation_id()
+        self.session = OrderSession(self.menu)
+        self._tools = ToolExecutor(self.session, self.submitter)
+        self._history: list[dict[str, Any]] = []
+        self._turn = 0
+
+    # ------------------------------------------------------------------ public API
+
+    def send(self, message: str) -> dict[str, Any]:
+        self._turn += 1
+        structlog.contextvars.bind_contextvars(
+            conversation_id=self.conversation_id, turn=self._turn
+        )
+        try:
+            return self._send(message)
+        finally:
+            structlog.contextvars.unbind_contextvars("conversation_id", "turn")
+
+    # ------------------------------------------------------------------ internals
+
+    def _send(self, message: str) -> dict[str, Any]:
+        text = (message or "").strip()
+        trace = TurnTrace(self.conversation_id, self._turn, text)
+        log.info("turn.start", chars=len(text))
+
+        if not text:
+            return self._finish(trace, EMPTY_INPUT_REPLY, [])
+        limit = self.settings.max_user_message_chars
+        if len(text) > limit:
+            trace.errors.append("input_too_long")
+            return self._finish(
+                trace,
+                f"That message is a bit long; could you keep it under {limit} characters?",
+                [],
+            )
+
+        self._history.append({"role": "user", "content": text})
+        external_calls: list[dict[str, Any]] = []
+        events: set[str] = set()
+        reply: str | None = None
+
+        for _ in range(self.settings.max_tool_iterations):
+            try:
+                response = self._call_llm(trace)
+            except LLMError as exc:
+                trace.errors.append(f"llm_error: {exc}")
+                log.exception("llm.failed")
+                reply = LLM_DOWN_REPLY
+                break
+
+            if not response.tool_calls:
+                reply = response.content.strip() or "Anything else I can get you?"
+                break
+
+            self._history.append(
+                {
+                    "role": "assistant",
+                    "content": response.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.name, "arguments": tc.arguments},
+                        }
+                        for tc in response.tool_calls
+                    ],
+                }
+            )
+            for tc in response.tool_calls:
+                result = self._tools.execute(tc.name, tc.arguments, turn=self._turn)
+                events.update(result.events)
+                if result.external_call is not None:
+                    external_calls.append(result.external_call)
+                trace.add_step(
+                    "tool",
+                    name=tc.name,
+                    arguments=tc.arguments,
+                    ok=result.content.get("ok"),
+                    result=result.content,
+                )
+                log.info("tool.call", tool=tc.name, ok=result.content.get("ok"))
+                self._history.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": tc.name,
+                        "content": result.to_message_content(),
+                    }
+                )
+        else:
+            trace.errors.append("max_tool_iterations")
+            log.warning("agent.max_iterations")
+            reply = STUCK_REPLY.format(summary=self.session.cart.summary_text())
+
+        assert reply is not None  # every branch above sets it  # noqa: S101
+        reply = self._enforce_reply_invariants(reply, events, external_calls)
+        self._history.append({"role": "assistant", "content": reply})
+        return self._finish(trace, reply, external_calls)
+
+    def _call_llm(self, trace: TurnTrace) -> Any:
+        messages = [
+            build_system_message(
+                self._static_prompt, self.session.cart.snapshot(), self.session.phase.value
+            ),
+            *self._trimmed_history(),
+        ]
+        response = self.llm.complete(messages, TOOL_SCHEMAS)
+        cost = (
+            response.prompt_tokens * self.settings.llm_input_cost_per_mtok
+            + response.completion_tokens * self.settings.llm_output_cost_per_mtok
+        ) / 1_000_000
+        trace.add_usage(response.prompt_tokens, response.completion_tokens, cost)
+        trace.add_step(
+            "llm",
+            model=response.model or self.llm.model,
+            latency_ms=response.latency_ms,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+            finish_reason=response.finish_reason,
+            tool_calls=[tc.name for tc in response.tool_calls],
+        )
+        log.info(
+            "llm.call",
+            model=response.model or self.llm.model,
+            latency_ms=response.latency_ms,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+            tool_calls=[tc.name for tc in response.tool_calls],
+        )
+        return response
+
+    def _trimmed_history(self) -> list[dict[str, Any]]:
+        """Keep the last N messages, cut at a user-message boundary.
+
+        Cutting elsewhere could orphan a tool result from its tool call, which
+        providers reject. The cart lives in the system prompt, so old turns are
+        expendable.
+        """
+        limit = self.settings.max_history_messages
+        if len(self._history) <= limit:
+            return self._history
+        start = len(self._history) - limit
+        while start < len(self._history) and self._history[start]["role"] != "user":
+            start += 1
+        return self._history[start:]
+
+    def _enforce_reply_invariants(
+        self, reply: str, events: set[str], external_calls: list[dict[str, Any]]
+    ) -> str:
+        """Deterministic guards on facts the customer must get exactly right."""
+        awaiting = self.session.phase is OrderPhase.AWAITING_CONFIRMATION
+        if "reviewed" in events and awaiting and "submit_attempted" not in events:
+            summary = self.session.cart.summary_text()
+            total = self.session.cart.snapshot()["total"]
+            if total not in reply:
+                log.warning("reply.guard", guard="review_total_missing")
+                reply = f"{reply}\n\n{summary}\nReady to submit?"
+        if "submitted" in events:
+            order_id = str(external_calls[-1]["result"].get("order_id", ""))
+            if order_id and order_id not in reply:
+                log.warning("reply.guard", guard="order_id_missing")
+                reply = f"{reply}\nOrder #{order_id}."
+        return reply
+
+    def _finish(
+        self, trace: TurnTrace, reply: str, external_calls: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        record = trace.to_record(
+            assistant_message=reply,
+            external_tool_calls=external_calls,
+            cart=self.session.cart.snapshot(),
+            phase=self.session.phase.value,
+        )
+        self._traces.write(record)
+        log.info(
+            "turn.end",
+            latency_ms=record["latency_ms"],
+            phase=record["phase"],
+            **record["usage"],
+            errors=trace.errors or None,
+        )
+        response: dict[str, Any] = {"message": reply}
+        if external_calls:
+            response["tool_calls"] = external_calls
+        return response

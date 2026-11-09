@@ -1,0 +1,177 @@
+menu:
+  # ----- BURGERS -----
+  - id: classic_burger
+    name: Classic Burger
+    base_price: 8.50
+    options:
+      size:
+        type: single_choice
+        required: true
+        choices: [regular, large]
+        default: regular
+        price_modifier:
+          regular: 0
+          large: 2.00
+      patty:
+        type: single_choice
+        required: false
+        choices: [beef, chicken, veggie]
+        default: beef
+    extras:
+      type: multi_choice
+      choices:
+        - id: cheese
+          price: 1.00
+        - id: bacon
+          price: 1.50
+        - id: avocado
+          price: 2.00
+        - id: extra_patty
+          price: 3.00
+
+  - id: spicy_burger
+    name: Spicy Jalapeño Burger
+    base_price: 9.50
+    options:
+      size:
+        type: single_choice
+        required: true
+        choices: [regular, large]
+        default: regular
+        price_modifier:
+          regular: 0
+          large: 2.00
+      spice_level:
+        type: single_choice
+        required: false
+        choices: [mild, medium, hot, extra_hot]
+        default: medium
+    extras:
+      type: multi_choice
+      choices:
+        - id: cheese
+          price: 1.00
+        - id: bacon
+          price: 1.50
+        - id: jalapeños
+          price: 0.75
+
+  # ----- PIZZAS -----
+  - id: margherita
+    name: Margherita Pizza
+    base_price: 12.00
+    options:
+      size:
+        type: single_choice
+        required: true
+        choices: [small, medium, large]
+        default: medium
+        price_modifier:
+          small: -2.00
+          medium: 0
+          large: 4.00
+      crust:
+        type: single_choice
+        required: false
+        choices: [thin, regular, thick]
+        default: regular
+    extras:
+      type: multi_choice
+      choices:
+        - id: extra_cheese
+          price: 2.00
+        - id: olives
+          price: 1.50
+        - id: mushrooms
+          price: 1.50
+        - id: pepperoni
+          price: 2.00
+
+  # ----- SIDES -----
+  - id: fries
+    name: French Fries
+    base_price: 3.50
+    options:
+      size:
+        type: single_choice
+        required: true
+        choices: [small, medium, large]
+        default: medium
+        price_modifier:
+          small: -1.00
+          medium: 0
+          large: 1.50
+    extras:
+      type: multi_choice
+      choices:
+        - id: truffle_oil
+          price: 2.00
+        - id: parmesan
+          price: 1.00
+        - id: cheese_sauce
+          price: 1.50
+
+  - id: onion_rings
+    name: Onion Rings
+    base_price: 4.50
+    options:
+      size:
+        type: single_choice
+        required: true
+        choices: [small, medium, large]
+        default: medium
+        price_modifier:
+          small: -1.00
+          medium: 0
+          large: 1.50
+    extras:
+      type: multi_choice
+      choices:
+        - id: ranch_dip
+          price: 0.75
+        - id: spicy_mayo
+          price: 0.75
+
+  # ----- DRINKS -----
+  - id: soda
+    name: Soft Drink
+    base_price: 2.00
+    options:
+      size:
+        type: single_choice
+        required: true
+        choices: [small, medium, large]
+        default: medium
+        price_modifier:
+          small: -0.50
+          medium: 0
+          large: 0.75
+      flavor:
+        type: single_choice
+        required: true
+        choices: [cola, diet_cola, lemon_lime, orange]
+        default: cola
+
+  - id: milkshake
+    name: Milkshake
+    base_price: 5.50
+    options:
+      size:
+        type: single_choice
+        required: true
+        choices: [regular, large]
+        default: regular
+        price_modifier:
+          regular: 0
+          large: 2.00
+      flavor:
+        type: single_choice
+        required: true
+        choices: [vanilla, chocolate, strawberry, oreo]
+    extras:
+      type: multi_choice
+      choices:
+        - id: whipped_cream
+          price: 0.50
+        - id: cherry_on_top
+          price: 0.25

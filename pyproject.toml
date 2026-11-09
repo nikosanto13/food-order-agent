@@ -1,0 +1,84 @@
+[project]
+name = "food-order-agent"
+version = "0.1.0"
+description = "Agentic food-ordering chatbot (MCP + LLM tool calling)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "anyio>=4.16.0",
+    "httpx2>=2.16.0",
+    "mcp>=2.3.0",
+    "mcp-types>=2.3.0",
+    "mistralai>=3.7.0",
+    "pydantic>=2.14.3",
+    "pydantic-settings>=2.16.2",
+    "pyyaml>=6.0.3",
+    "starlette>=1.10.0",
+    "structlog>=26.1.0",
+    "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.4",
+    "ty>=0.0.99",
+]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "N",        # pep8-naming
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "S",        # bandit (security)
+    "C4",       # comprehensions
+    "SIM",      # simplify
+    "RET",      # return statements
+    "PT",       # pytest style
+    "PERF",     # performance anti-patterns
+    "DTZ",      # naive datetimes
+    "TRY",      # exception handling hygiene
+    "PL",       # pylint
+    "RUF",      # ruff-specific
+    "T20",      # no stray print()
+    "BLE",      # no blind `except Exception` without care
+    "ANN",      # type annotations everywhere
+]
+ignore = [
+    "PLR0913",  # too many arguments: constructors with DI are explicit on purpose
+    "TRY003",   # long messages in exceptions are fine (they are shown to the LLM)
+    "ANN401",   # Any is sometimes the honest type (JSON payloads)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "ANN", "S106"]
+"evals/**" = ["T20", "PLR2004"]
+"main.py" = ["T20"]
+
+# ---------------------------------------------------------------- ty
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.src]
+include = ["food_agent", "tests", "evals", "agent.py", "main.py"]
+
+[tool.ty.rules]
+possibly-unresolved-reference = "error"
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "live: hits real external services (LLM / prod MCP); deselected by default",
+]
+filterwarnings = ["error::DeprecationWarning:food_agent.*"]

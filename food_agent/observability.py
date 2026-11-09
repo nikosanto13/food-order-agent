@@ -92,17 +92,34 @@ class TurnTrace:
     _t0: float = field(default_factory=time.perf_counter)
     steps: list[dict[str, Any]] = field(default_factory=list)
     prompt_tokens: int = 0
+    cached_prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float = 0.0
+    unpriced_calls: int = 0  # calls to a model missing from the pricing registry
     errors: list[str] = field(default_factory=list)
 
     def add_step(self, kind: str, **data: Any) -> None:
         self.steps.append({"type": kind, "seq": len(self.steps) + 1, **data})
 
-    def add_usage(self, prompt_tokens: int, completion_tokens: int, cost_usd: float) -> None:
+    def add_usage(
+        self,
+        prompt_tokens: int,
+        cached_prompt_tokens: int,
+        completion_tokens: int,
+        cost_usd: float | None,
+    ) -> None:
         self.prompt_tokens += prompt_tokens
+        self.cached_prompt_tokens += cached_prompt_tokens
         self.completion_tokens += completion_tokens
-        self.cost_usd += cost_usd
+        if cost_usd is None:
+            self.unpriced_calls += 1
+        else:
+            self.cost_usd += cost_usd
+
+    @property
+    def total_cost_usd(self) -> float | None:
+        """``None`` when any call couldn't be priced: a partial sum would under-report."""
+        return None if self.unpriced_calls else round(self.cost_usd, 6)
 
     @property
     def elapsed_ms(self) -> float:
@@ -129,8 +146,9 @@ class TurnTrace:
             "phase": phase,
             "usage": {
                 "prompt_tokens": self.prompt_tokens,
+                "cached_prompt_tokens": self.cached_prompt_tokens,
                 "completion_tokens": self.completion_tokens,
-                "cost_usd": round(self.cost_usd, 6),
+                "cost_usd": self.total_cost_usd,
                 "llm_calls": sum(1 for s in self.steps if s["type"] == "llm"),
             },
             "errors": self.errors,

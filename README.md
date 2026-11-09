@@ -74,7 +74,6 @@ and has a seedable random "kitchen busy" rate.
 | `MAX_TOOL_ITERATIONS` | `8` | LLM↔tool steps per user turn |
 | `MAX_HISTORY_MESSAGES` | `40` | Chat history sent to the LLM |
 | `LOG_LEVEL`, `LOG_DIR`, `LOG_TO_STDERR` | `INFO`, `logs`, `false` | Observability |
-| `LLM_INPUT_COST_PER_MTOK`, `LLM_OUTPUT_COST_PER_MTOK` | `0.10`, `0.30` | USD per 1M tokens, used for cost **estimates** in traces |
 
 ---
 
@@ -98,6 +97,7 @@ user text ─►│ pre-checks ─► LLM ◄──► ToolExecutor ──► Or
 | `food_agent/tools.py` | The LLM's tool surface: schemas from Pydantic arg models, execution, errors returned as data |
 | `food_agent/agent.py` | The turn loop, history management, reply guards, tracing |
 | `food_agent/llm.py` | `LLMClient` protocol + Mistral adapter (SDK-level backoff on 429/5xx) |
+| `food_agent/pricing.py` | Per-model token price registry (input / cached input / output) for cost estimates |
 | `food_agent/mcp_client.py` | MCP client: outcome classification, retry policy, idempotency |
 | `food_agent/mock_server.py` | Local MCP server with the same contract (dev + tests) |
 | `food_agent/observability.py` | structlog JSON config, redaction, per-turn trace records |
@@ -223,8 +223,13 @@ jq -c '{turn, user_message, assistant_message, usage}' logs/conversations/conv_*
 - **Bounded context.** History is trimmed to the last N messages, always cut at a user-message
   boundary so a tool result is never separated from its tool call. Because the cart is in the
   prompt, old turns aren't needed.
-- **No LLM call** for empty or oversized input. `max_tokens` is capped. Tokens and estimated cost
-  are logged for every call and every turn.
+- **No LLM call** for empty or oversized input. `max_tokens` is capped. Tokens (including cached
+  prompt tokens) and estimated cost are logged for every call and every turn.
+- **Cache-aware cost estimates.** Prices live in a per-model registry in code
+  (`food_agent/pricing.py`), not in configuration. Cached prompt tokens (reported by the provider
+  as a subset of prompt tokens) are billed at the cached-input rate, the rest at the input rate.
+  A model without a registered price logs `llm.pricing_missing` at startup and its cost is
+  reported as `null` rather than a misleading partial number.
 - **Connect per submission.** Orders are submitted about once per conversation, so the MCP session
   is opened only when needed. The cost is one handshake per order. In return `send()` stays
   synchronous, there is no background event loop to manage, and per-request headers are trivial.
@@ -267,33 +272,20 @@ The agent is deliberately **strict about the order and relaxed about the convers
 ## Quality gates
 
 ```bash
-make check      # ruff format --check · ruff check · ty check · pytest
+make check      # format, linting, typechecking, pytest
 make fmt        # auto-format + autofix
 ```
 
 - **ruff**, with a broad rule set (pyflakes, bugbear, bandit `S`, pylint `PL`, `TRY`, `PERF`,
-  `ANN`, `T20`, ...); see `pyproject.toml`. **ty** type-checks the package, the tests and the
+  `ANN`, `T20`, ...); see `pyproject.toml`.
+- **ty** type-checks the package, the tests and the
   entry points.
-- **pytest**, 83 tests, offline and deterministic (about 1 s):
-  - `test_menu.py`: parsing and integrity errors.
-  - `test_cart.py`: the brief's totals ($11.50, $22.25), validation messages, normalisation
-    (`"Extra Hot"` → `extra_hot`, Unicode `jalapeños`), sanitisation, partial removal, line splitting, and the confirmation guard.
-  - `test_mcp.py`: every outcome over real Streamable HTTP against the mock: forced failures,
-    schema errors, missing email, unreachable server, recovery on retry.
-  - `test_agent.py`: the full loop with a scripted LLM. Covers brief example 1 end to end,
-    submit-in-same-turn and submit-without-review blocked, an LLM-supplied payload rejected, busy
-    kitchen then retry, self-correction after tool errors, malformed tool calls, LLM outage,
-    bounded loop, reply guards, state injection, history trimming, trace contents, and a replay of a
-    real over-limit conversation ("remove the one large" → 2 left; re-review → "yes" submits),
-    "add all extras to one of the three" splitting the line, and the multi-unit reply guard.
+- **pytest**, unit tests, offline and deterministic (about 1 s):
 - **CI**: GitHub Actions runs the same gates on every push and PR.
-
-The scripted LLM tests the **plumbing and the guarantees**. Whether the real model makes good
-decisions is measured by evals (next section).
 
 ---
 
-## Roadmap / with more time
+## Roadmap
 
 - **Evals** (next): scripted multi-turn scenarios run against the real LLM and the mock server. The
   assertions are deterministic: the final submitted payload, no submission without confirmation,

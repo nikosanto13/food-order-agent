@@ -18,9 +18,6 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.2, ge=0, le=1)
     llm_timeout_s: float = Field(default=30, gt=0)
     llm_max_output_tokens: int = Field(default=600, gt=0)
-    # USD per 1M tokens, for cost *estimates* in traces. Override when prices change.
-    llm_input_cost_per_mtok: float = 0.10
-    llm_output_cost_per_mtok: float = 0.30
 
     # --- MCP order server ---
     mcp_url: str = "http://127.0.0.1:8765/mcp"

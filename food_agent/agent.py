@@ -32,6 +32,7 @@ from food_agent.observability import (
     configure_logging,
     new_conversation_id,
 )
+from food_agent.pricing import estimate_cost, pricing_for
 from food_agent.prompts import build_static_prompt, build_system_message
 from food_agent.tools import TOOL_SCHEMAS, ToolExecutor
 
@@ -69,6 +70,8 @@ class FoodOrderAgent:
             )
         self.menu = menu or load_menu()
         self.llm = llm or self._default_llm()
+        if pricing_for(self.llm.model) is None:
+            log.warning("llm.pricing_missing", model=self.llm.model, detail="cost_usd will be null")
         self.submitter = submitter or McpOrderSubmitter(
             self.settings.mcp_url,
             applicant_email=self.settings.applicant_email,
@@ -207,17 +210,27 @@ class FoodOrderAgent:
             *self._trimmed_history(),
         ]
         response = self.llm.complete(messages, TOOL_SCHEMAS)
-        cost = (
-            response.prompt_tokens * self.settings.llm_input_cost_per_mtok
-            + response.completion_tokens * self.settings.llm_output_cost_per_mtok
-        ) / 1_000_000
-        trace.add_usage(response.prompt_tokens, response.completion_tokens, cost)
+        # Price by the model we asked for: the response may echo a dated snapshot id.
+        cost = estimate_cost(
+            self.llm.model,
+            prompt_tokens=response.prompt_tokens,
+            cached_prompt_tokens=response.cached_prompt_tokens,
+            completion_tokens=response.completion_tokens,
+        )
+        trace.add_usage(
+            response.prompt_tokens,
+            response.cached_prompt_tokens,
+            response.completion_tokens,
+            cost,
+        )
         trace.add_step(
             "llm",
             model=response.model or self.llm.model,
             latency_ms=response.latency_ms,
             prompt_tokens=response.prompt_tokens,
+            cached_prompt_tokens=response.cached_prompt_tokens,
             completion_tokens=response.completion_tokens,
+            cost_usd=cost,
             finish_reason=response.finish_reason,
             tool_calls=[tc.name for tc in response.tool_calls],
         )
@@ -226,7 +239,9 @@ class FoodOrderAgent:
             model=response.model or self.llm.model,
             latency_ms=response.latency_ms,
             prompt_tokens=response.prompt_tokens,
+            cached_prompt_tokens=response.cached_prompt_tokens,
             completion_tokens=response.completion_tokens,
+            cost_usd=cost,
             tool_calls=[tc.name for tc in response.tool_calls],
         )
         return response

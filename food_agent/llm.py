@@ -33,7 +33,8 @@ class ToolCallRequest:
 class LLMResponse:
     content: str
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
-    prompt_tokens: int = 0
+    prompt_tokens: int = 0  # includes cached_prompt_tokens
+    cached_prompt_tokens: int = 0
     completion_tokens: int = 0
     model: str = ""
     finish_reason: str | None = None
@@ -46,19 +47,6 @@ class LLMClient(Protocol):
     def complete(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> LLMResponse: ...
-
-
-def _content_to_text(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    # Mistral may return a list of content chunks; keep only text chunks.
-    parts = [
-        getattr(c, "text", None) or (c.get("text") if isinstance(c, dict) else None)
-        for c in content
-    ]
-    return "".join(p for p in parts if p)
 
 
 class MistralLLM:
@@ -125,11 +113,45 @@ class MistralLLM:
             for i, tc in enumerate(msg.tool_calls or [])
         ]
         return LLMResponse(
-            content=_content_to_text(msg.content),
+            content=self._content_to_text(msg.content),
             tool_calls=tool_calls,
             prompt_tokens=res.usage.prompt_tokens or 0,
+            cached_prompt_tokens=self._cached_prompt_tokens(res.usage),
             completion_tokens=res.usage.completion_tokens or 0,
             model=res.model,
             finish_reason=str(choice.finish_reason) if choice.finish_reason else None,
             latency_ms=latency_ms,
         )
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        # Mistral may return a list of content chunks; keep only text chunks.
+        parts = [
+            getattr(c, "text", None) or (c.get("text") if isinstance(c, dict) else None)
+            for c in content
+        ]
+        return "".join(p for p in parts if p)
+
+    @staticmethod
+    def _cached_prompt_tokens(usage: Any) -> int:
+        """Read ``usage.prompt_tokens_details.cached_tokens``.
+
+        The SDK's ``UsageInfo`` doesn't declare the field, so it arrives as an extra
+        attribute holding either a dict or a model object depending on SDK version.
+        """
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details is None:
+            extra = getattr(usage, "additional_properties", None) or {}
+            details = extra.get("prompt_tokens_details")
+        if details is None:
+            return 0
+        cached = (
+            details.get("cached_tokens")
+            if isinstance(details, dict)
+            else getattr(details, "cached_tokens", None)
+        )
+        return int(cached or 0)

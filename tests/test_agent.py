@@ -267,6 +267,31 @@ def test_every_turn_is_traced(settings):
     assert record["phase"] == "building"
 
 
+def test_turn_cost_uses_registry_and_cached_tokens(settings):
+    from food_agent.llm import LLMResponse  # noqa: PLC0415
+
+    hit = LLMResponse(
+        content="Hi!", prompt_tokens=1_000, cached_prompt_tokens=800, completion_tokens=100
+    )
+    llm = ScriptedLLM([hit], model="mistral-small-latest")
+    agent = FoodOrderAgent(llm=llm, submitter=CannedSubmitter(), settings=settings)
+    agent.send("hi")
+    path = settings.log_dir / "conversations" / f"{agent.conversation_id}.jsonl"
+    record = json.loads(path.read_text().splitlines()[-1])
+    # 200 * 0.15 + 800 * 0.015 + 100 * 0.60 per 1M tokens
+    assert record["usage"]["cached_prompt_tokens"] == 800
+    assert record["usage"]["cost_usd"] == pytest.approx(0.000102)
+    assert record["steps"][0]["cached_prompt_tokens"] == 800
+
+
+def test_unpriced_model_reports_null_cost(settings):
+    agent, _ = make_agent(settings, [say("Hi!")])  # ScriptedLLM model "scripted" has no price
+    agent.send("hi")
+    path = settings.log_dir / "conversations" / f"{agent.conversation_id}.jsonl"
+    record = json.loads(path.read_text().splitlines()[-1])
+    assert record["usage"]["cost_usd"] is None
+
+
 # ------------------------------------------------------------------ removal & checkout flow
 def _over_limit_cart_script():
     """The cart from a real conversation: 3 large + 2 regular burgers = $58.00."""

@@ -1,0 +1,25 @@
+name: Audit
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: [pyproject.toml, uv.lock, .github/workflows/audit.yml]
+  schedule:
+    - cron: "17 6 * * 1"  # Mondays 06:17 UTC: catch advisories published since the last change
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # `uv audit` is a preview feature; pin uv so a CLI change can't break CI unannounced.
+          version: "0.13.4"
+          enable-cache: true
+      - name: Vulnerability scan
+        run: uv audit --locked --preview-features audit-command

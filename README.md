@@ -274,6 +274,7 @@ The agent is deliberately **strict about the order and relaxed about the convers
 ```bash
 make check      # format, linting, typechecking, pytest
 make fmt        # auto-format + autofix
+make audit      # scan locked dependencies for known vulnerabilities
 ```
 
 - **ruff**, with a broad rule set (pyflakes, bugbear, bandit `S`, pylint `PL`, `TRY`, `PERF`,
@@ -281,7 +282,11 @@ make fmt        # auto-format + autofix
 - **ty** type-checks the package, the tests and the
   entry points.
 - **pytest**, unit tests, offline and deterministic (about 1 s):
-- **CI**: GitHub Actions runs the same gates on every push and PR.
+- **uv audit** checks every locked dependency against the OSV vulnerability database. It is
+  separate from `make check` because it needs network access. Accepted findings go in
+  `[tool.uv.audit]` in `pyproject.toml`.
+- **CI**: GitHub Actions runs the same gates on every push and PR, and runs the audit weekly as
+  well, because new advisories appear without any code change.
 
 ---
 

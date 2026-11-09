@@ -26,6 +26,12 @@ dev = [
     "ty>=0.0.99",
 ]
 
+# ---------------------------------------------------------------- uv audit
+# Vulnerability IDs accepted on purpose. Add a comment with the reason for each one.
+[tool.uv.audit]
+ignore = []
+ignore-until-fixed = []
+
 # ---------------------------------------------------------------- ruff
 [tool.ruff]
 line-length = 100

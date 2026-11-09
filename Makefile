@@ -1,4 +1,4 @@
-.PHONY: install fmt lint typecheck test check mock-server run evals
+.PHONY: install fmt lint typecheck test check audit mock-server run evals
 
 install:
 	uv sync
@@ -18,6 +18,10 @@ test:
 	uv run pytest
 
 check: lint typecheck test
+
+# Scan locked dependencies for known vulnerabilities (OSV). Needs network, so not part of `check`.
+audit:
+	uv audit --locked --preview-features audit-command
 
 mock-server:
 	uv run python -m food_agent.mock_server

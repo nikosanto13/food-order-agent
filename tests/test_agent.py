@@ -469,70 +469,7 @@ def test_update_one_of_several_units_splits_the_line(settings):
     assert result["unchanged_on_original_line"]["description"] == "2x Large Classic Burger"
     assert [ln["quantity"] for ln in agent.session.cart.snapshot()["lines"]] == [2, 1]
     assert agent.session.cart.snapshot()["total"] == "$39.00"
-    assert "(" not in r["message"]  # the model stated both lines; no guard note needed
-
-
-def test_guard_states_split_when_the_reply_paraphrases_it(settings):
-    agent, _ = make_agent(
-        settings,
-        [
-            tools(call("add_item", THREE_LARGE)),
-            say("Added. Anything else?"),
-            tools(call("update_item", {"line_id": 1, "units": 1, "add_extras": ALL_EXTRAS})),
-            say("Updated one of the large burgers with all extras. Anything else?"),
-        ],
-    )
-    agent.send("three large burgers")
-    r = agent.send("one of them with all extras")
-    assert r["message"].endswith(
-        "(Your order now has: 2x Large Classic Burger; "
-        "Large Classic Burger with cheese, bacon, avocado and extra patty.)"
-    )
-
-
-def test_guard_exposes_a_whole_line_update_described_as_one_unit(settings):
-    """The real bug: all 3 changed, but the model said 'one of them'. The customer must see it."""
-    agent, _ = make_agent(
-        settings,
-        [
-            tools(call("add_item", THREE_LARGE)),
-            say("Added. Anything else?"),
-            tools(call("update_item", {"line_id": 1, "add_extras": ALL_EXTRAS})),
-            say("Updated one of the large burgers with cheese, bacon, avocado and extra patty."),
-        ],
-    )
-    agent.send("three large burgers")
-    r = agent.send("in one of them, add all extras")
-    assert "3x Large Classic Burger with cheese, bacon, avocado and extra patty" in r["message"]
-
-
-def test_guard_states_full_removal_of_a_multi_unit_line(settings):
-    agent, _ = make_agent(
-        settings,
-        [
-            tools(call("add_item", THREE_LARGE)),
-            say("Added. Anything else?"),
-            tools(call("remove_item", {"line_id": 1})),
-            say("Removed the large burger."),
-        ],
-    )
-    agent.send("three large burgers")
-    r = agent.send("remove the large one")
-    assert r["message"].endswith("(Removed: 3x Large Classic Burger.)")
-
-
-def test_guard_stays_silent_for_single_unit_changes(settings):
-    agent, _ = make_agent(
-        settings,
-        [
-            tools(call("add_item", {"item_id": "fries"})),
-            say("Added fries."),
-            tools(call("update_item", {"line_id": 1, "options": {"size": "large"}})),
-            say("Made them large."),
-        ],
-    )
-    agent.send("fries")
-    assert agent.send("make it large") == {"message": "Made them large."}
+    assert r["message"].endswith("2x Large Classic Burger unchanged. Anything else?")
 
 
 # ------------------------------------------------------------------ trace sections (voice)

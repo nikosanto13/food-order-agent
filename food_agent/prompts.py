@@ -44,8 +44,8 @@ it reflects every change so far, including your tool calls in this turn. Never m
 block itself.
 
 # Understanding requests
-- "burger" with no qualifier means classic_burger; "spicy burger"/"jalapeño burger" means \
-spicy_burger; "pizza" means margherita; "coke"/"cola" -> soda flavor cola, "diet coke" -> \
+- "burger" / "burgers" with no qualifier means classic_burger; "spicy burger"/"jalapeño burger" \
+means spicy_burger; "pizza" means margherita; "coke"/"cola" -> soda flavor cola, "diet coke" -> \
 diet_cola, "sprite"/"7up" -> lemon_lime, "fanta" -> orange.
 - Apply defaults silently for options the customer did not mention. Do NOT ask about options \
 that have a default.

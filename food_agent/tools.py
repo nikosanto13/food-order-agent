@@ -43,7 +43,11 @@ class AddItemArgs(_Args):
     quantity: int = Field(default=1, ge=1, le=MAX_LINE_QUANTITY)
     options: dict[str, str] = Field(
         default_factory=dict,
-        description="Option name -> choice, e.g. {'size': 'large'}. Omit options to use defaults.",
+        description=(
+            "Option name -> choice, string -> string only, e.g. {'size': 'large'}. Omit "
+            "options to use defaults. Extras do NOT go here; put them in the top-level "
+            "`extras` field."
+        ),
     )
     extras: list[str] = Field(default_factory=list, description="Extra ids, e.g. ['cheese'].")
 
@@ -52,7 +56,11 @@ class UpdateItemArgs(_Args):
     line_id: int = Field(description="line_id of the order line to change.")
     quantity: int | None = Field(default=None, ge=1, le=MAX_LINE_QUANTITY)
     options: dict[str, str] | None = Field(
-        default=None, description="Only the options to change, e.g. {'size': 'regular'}."
+        default=None,
+        description=(
+            "Only the options to change, string -> string only, e.g. {'size': 'regular'}. "
+            "Extras do NOT go here; use the top-level `add_extras` / `remove_extras` fields."
+        ),
     )
     add_extras: list[str] | None = None
     remove_extras: list[str] | None = None
@@ -179,11 +187,6 @@ class ToolResult:
     content: dict[str, Any]
     external_call: dict[str, Any] | None = None  # set when an MCP tool was actually invoked
     events: list[str] = field(default_factory=list)  # e.g. "reviewed", "submitted"
-    # Changes the reply must state exactly (multi-unit lines, where "one of them" vs "all of
-    # them" is easy to get wrong): line ids whose current description must appear, and
-    # descriptions of multi-unit lines removed entirely.
-    touched_lines: list[int] = field(default_factory=list)
-    removed_lines: list[str] = field(default_factory=list)
 
     def to_message_content(self) -> str:
         return json.dumps(self.content, ensure_ascii=False, default=str)
@@ -227,14 +230,7 @@ class ToolExecutor:
     def _line(self, line: Any) -> dict[str, Any]:
         return {"line_id": line.line_id, "description": describe_line(self._session.menu, line)}
 
-    def _changed(
-        self,
-        content: dict[str, Any],
-        turn: int,
-        *,
-        touched: list[int] | None = None,
-        removed: list[str] | None = None,
-    ) -> ToolResult:
+    def _changed(self, content: dict[str, Any], turn: int) -> ToolResult:
         """Result of a successful cart change.
 
         If the customer is already checking out, re-run the review right away and
@@ -244,7 +240,7 @@ class ToolExecutor:
         the error is attached instead and the order stays in the building phase.
         """
         content["order"] = self._order()
-        result = ToolResult(content, touched_lines=touched or [], removed_lines=removed or [])
+        result = ToolResult(content)
         if not self._session.checkout_requested:
             return result
         try:
@@ -284,7 +280,6 @@ class ToolExecutor:
             units=args.units,
         )
         content: dict[str, Any] = {"ok": True, "updated": self._line(line)}
-        touched: list[int] = []
         if line.line_id != args.line_id:  # split: some units changed, the rest are untouched
             unchanged = self._session.cart.get(args.line_id)
             content["unchanged_on_original_line"] = self._line(unchanged)
@@ -292,10 +287,7 @@ class ToolExecutor:
                 f"Only {line.quantity} of {before} changed; the line was split. In the "
                 "confirmation, mention both the changed and the unchanged items."
             )
-            touched = [args.line_id, line.line_id]
-        elif max(before, line.quantity) > 1:
-            touched = [line.line_id]
-        return self._changed(content, turn, touched=touched)
+        return self._changed(content, turn)
 
     def _remove_item(self, args: RemoveItemArgs, turn: int) -> ToolResult:
         removed, remaining = self._session.remove(args.line_id, args.quantity)
@@ -305,10 +297,7 @@ class ToolExecutor:
             "removed": self._line(removed),
             "remaining_on_line": self._line(remaining) if remaining else None,
         }
-        if remaining is not None:
-            return self._changed(content, turn, touched=[remaining.line_id])
-        removed_text = [content["removed"]["description"]] if removed.quantity > 1 else []
-        return self._changed(content, turn, removed=removed_text)
+        return self._changed(content, turn)
 
     def _clear_order(self, _args: NoArgs, _turn: int) -> ToolResult:
         self._session.clear()

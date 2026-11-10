@@ -347,10 +347,10 @@ class Cart:
 
     def to_submit_payload(self) -> dict[str, Any]:
         """The exact ``submit_order`` arguments. Built by code, never by the LLM."""
-        return {
-            "items": [ln.to_submit_item() for ln in self._lines.values()],
-            "special_instructions": self.special_instructions,
-        }
+        payload: dict[str, Any] = {"items": [ln.to_submit_item() for ln in self._lines.values()]}
+        if self.special_instructions:
+            payload["special_instructions"] = self.special_instructions
+        return payload
 
     def fingerprint(self) -> str:
         canonical = json.dumps(self.to_submit_payload(), sort_keys=True, ensure_ascii=False)

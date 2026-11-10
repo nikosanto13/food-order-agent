@@ -77,8 +77,8 @@ def create_server(
         items: Annotated[list[OrderItem], Field(description="List of order items")],
         ctx: Context,
         special_instructions: Annotated[
-            str | None, Field(description="Any special instructions for the order")
-        ] = None,
+            str, Field(description="Any special instructions for the order")
+        ] = "",
     ) -> Annotated[CallToolResult, SubmitOrderResult]:
         headers: dict[str, Any] = {k.lower(): v for k, v in (ctx.headers or {}).items()}
         if ctx.headers is not None and not headers.get(APPLICANT_HEADER):

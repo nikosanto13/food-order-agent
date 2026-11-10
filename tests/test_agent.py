@@ -68,7 +68,6 @@ def test_example_conversation_1_end_to_end(settings):
                 "extras": ["cheese"],
             }
         ],
-        "special_instructions": None,
     }
     assert tc["result"]["success"] is True
     assert tc["result"]["total"] == 11.5

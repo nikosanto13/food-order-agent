@@ -76,3 +76,18 @@ def test_only_known_safe_outcomes_are_retryable(outcome):
     assert outcome.retryable == (
         outcome in {SubmitOutcome.REFUSED, SubmitOutcome.SERVER_ERROR, SubmitOutcome.UNREACHABLE}
     )
+
+
+def test_null_special_instructions_are_rejected_like_prod():
+    """Prod rejects ``special_instructions: null``; the mock must too, so we never send it."""
+    res = McpOrderSubmitter(create_server(), backoff_s=0, max_attempts=1).submit(
+        {**FRIES, "special_instructions": None}
+    )
+    assert res.result["success"] is False
+
+
+def test_special_instructions_string_is_accepted():
+    res = McpOrderSubmitter(create_server(), backoff_s=0).submit(
+        {**FRIES, "special_instructions": "no salt"}
+    )
+    assert res.result["success"] is True

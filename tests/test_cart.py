@@ -117,7 +117,6 @@ def test_submit_payload_shape(menu):
                 "extras": ["cheese"],
             }
         ],
-        "special_instructions": None,
     }
 
 

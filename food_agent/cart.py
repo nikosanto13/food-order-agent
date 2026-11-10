@@ -72,9 +72,6 @@ class LineItem(BaseModel):
         }
 
 
-# --------------------------------------------------------------------------- validation
-
-
 def _resolve_item(menu: Menu, item_id: str) -> MenuItem:
     item = menu.get(normalize_token(item_id))
     if item is None:
@@ -175,9 +172,6 @@ def sanitize_special_instructions(text: str | None) -> str | None:
     return cleaned
 
 
-# --------------------------------------------------------------------------- pricing & text
-
-
 def unit_price(menu: Menu, line: LineItem) -> Decimal:
     item = _resolve_item(menu, line.item_id)
     price = item.base_price
@@ -218,9 +212,6 @@ def describe_line(menu: Menu, line: LineItem) -> str:
         joined = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
         text += f" with {joined}"
     return text
-
-
-# --------------------------------------------------------------------------- cart
 
 
 class Cart:
@@ -396,9 +387,6 @@ class Cart:
             lines.append(f"Special instructions: {self.special_instructions}")
         lines.append(f"Total: {money(self.total)}")
         return "\n".join(lines)
-
-
-# --------------------------------------------------------------------------- state machine
 
 
 class OrderPhase(StrEnum):

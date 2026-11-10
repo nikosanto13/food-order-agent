@@ -34,9 +34,6 @@ from food_agent.mcp_client import OrderSubmitter, SubmitOutcome
 logger = structlog.get_logger(__name__)
 
 
-# --------------------------------------------------------------------------- argument models
-
-
 class _Args(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -211,11 +208,13 @@ class ToolExecutor:
         spec = _SPECS_BY_NAME.get(name)
         if spec is None:
             return ToolResult({"ok": False, "error": f"Unknown tool {name!r}."})
+
         try:
             parsed = json.loads(raw_arguments or "{}")
             args = spec.args.model_validate(parsed)
         except (json.JSONDecodeError, ValidationError) as exc:
             return ToolResult({"ok": False, "error": f"Invalid arguments for {name}: {exc}"})
+
         try:
             return self._handlers[name](args, turn)
         except OrderError as exc:

@@ -1,4 +1,4 @@
-.PHONY: install install-voice fmt lint typecheck test test-live check audit mock-server run run-voice evals
+.PHONY: install install-voice fmt lint typecheck test test-live check audit mock-server run run-voice
 
 install:
 	uv sync
@@ -39,6 +39,3 @@ run:
 
 run-voice:
 	uv run --extra voice python main.py --voice
-
-evals:
-	uv run python -m evals.run

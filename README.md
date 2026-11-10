@@ -18,50 +18,31 @@ Agent: Order submitted! Order #ORD-48271. Estimated time: 15-20 minutes.
 
 ## Quickstart
 
-Requires [uv](https://docs.astral.sh/uv/) (it installs Python 3.13 for you).
+Requires [uv](https://docs.astral.sh/uv/) (it installs Python 3.13 for you). Run commands from the repository root.
 
 ```bash
-uv sync                       # create .venv with locked dependencies
-cp .env.example .env          # then set MISTRAL_API_KEY (and APPLICANT_EMAIL for prod)
-
-python main.py --local        # chat, submitting to a local mock MCP server (no setup)
-python main.py                # chat, submitting to MCP_URL from .env
+uv sync                          # create .venv with locked dependencies
+cp .env.example .env             # then set MISTRAL_API_KEY
+uv run python main.py --local    # chat, submitting to an in-process mock MCP server
 ```
 
-(`uv run python main.py ...` works the same if the venv isn't activated.)
+The mock server mirrors the production contract and returns "kitchen busy" on 10% of submissions,
+to exercise the retry path. Pass `--busy-rate 0` for a clean run.
 
-Useful flags: `--verbose` (stream JSON logs to stderr), `--force-failure kitchen_busy|server_error`
-(failure drills via `X-Demo-Force-Failure`), `--busy-rate 0.3` (mock's random busy rate).
-REPL commands: `/cart`, `/reset`, `/trace` (path of this conversation's trace), `/quit`.
-On exit, a dim summary shows the session's estimated cost by source (LLM, and in voice mode
-speech-to-text and text-to-speech).
-
-### Voice mode (optional)
-
-Hands-free: just talk. ElevenLabs Scribe transcribes you, the same agent handles the order,
-and ElevenLabs Flash speaks the reply, with live level bars for you and the agent.
+To submit to the production server instead, set these in `.env` and run `uv run python main.py`:
 
 ```bash
-uv sync --extra voice         # optional extra: elevenlabs + sounddevice + rich
-# set ELEVENLABS_API_KEY in .env
-python main.py --voice --local
+MCP_URL=https://webviews.moveo.ai/api/demo/mcp
+APPLICANT_EMAIL=you@example.com
 ```
 
-```
-You: a large margherita with olives
-Agent: Large Margherita Pizza with olives. Anything else?
-● Speaking        you
-Ctrl+C to quit    agent   ▃▅▆▆▅▃▁▂▄▆▆▆▄▁▂▄▆▆▆▄▂▁▃▅▆▆▅▂ ▃▅
-```
-
-Pause for about a second to end your turn. The microphone is off while the agent speaks, so
-it never hears itself, but headphones still work best. Ctrl+C while the agent speaks stops the
-audio; Ctrl+C while listening quits. Without the extra, everything else installs and runs as
-before; `--voice` just tells you what to install. Each turn's trace record gets a `voice` section with a latency breakdown
-(end of speech, STT, agent, time to first audio) and the estimated speech cost. See
-[design notes](docs/ARCHITECTURE.md#11-voice-an-optional-front-end).
+REPL commands: `/cart`, `/reset`, `/trace`, `/help`, `/quit`. Useful flags: `--verbose` (JSON logs
+to stderr) and `--force-failure kitchen_busy|server_error` (fail every submit, for drills).
 
 ### Programmatic API
+
+`FoodOrderAgent` submits to `MCP_URL`, so it needs a server: either the production URL above, or the
+mock started with `make mock-server` (listens on `127.0.0.1:8765`, the default `MCP_URL`).
 
 ```python
 from agent import FoodOrderAgent
@@ -76,19 +57,41 @@ agent.send("Yes")
 #  'tool_calls': [{'name': 'submit_order', 'arguments': {...}, 'result': {'success': True, ...}}]}
 ```
 
-Every collaborator is injectable: `FoodOrderAgent(llm=..., submitter=..., menu=..., settings=...)`.
+<details>
+<summary>Voice mode</summary>
 
-### Local MCP server
+Talk instead of typing - the agent speaks its replies and prints the transcript.
 
 ```bash
-make mock-server              # python -m food_agent.mock_server --port 8765 --busy-rate 0.1
+# elevenlabs + sounddevice + rich
+uv sync --extra voice
 ```
 
-It mirrors the documented contract of the provided server: same tool and schemas, requires
-`X-Applicant-Email`, refuses off-menu orders and totals over $50, honours `X-Demo-Force-Failure`,
-and has a seedable random "kitchen busy" rate.
+Then set `ELEVENLABS_API_KEY` in `.env`. Voice also needs PortAudio (macOS: `brew install portaudio`,
+Debian/Ubuntu: `sudo apt install libportaudio2`) and microphone access for your terminal (macOS asks
+on first run).
 
-### Configuration (`.env` / environment)
+```bash
+uv run python main.py --voice --local
+```
+
+```text
+You: a large margherita with olives
+Agent: Large Margherita Pizza with olives. Anything else?
+● Speaking        you
+Ctrl+C to quit    agent   ▃▅▆▆▅▃▁▂▄▆▆▆▄▁▂▄▆▆▆▄▂▁▃▅▆▆▅▂ ▃▅
+```
+
+> **⚠️ Warning:**
+> Voice mode is early-stage. See the [design notes](docs/ARCHITECTURE.md#11-voice-an-optional-front-end)
+> and [future steps](#future-steps).
+
+</details>
+
+<details>
+<summary>Configuration</summary>
+
+Set any of these in `.env`:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -97,7 +100,7 @@ and has a seedable random "kitchen busy" rate.
 | `MCP_URL` | `http://127.0.0.1:8765/mcp` | Order server (Streamable HTTP) |
 | `APPLICANT_EMAIL` | — | Sent as `X-Applicant-Email` |
 | `MCP_MAX_ATTEMPTS` | `3` | Attempts for retryable submit failures |
-| `MCP_FORCE_FAILURE` | — | `kitchen_busy` / `server_error` drill header |
+| `MCP_FORCE_FAILURE` | — | `kitchen_busy` / `server_error` drill header (same as `--force-failure`) |
 | `MAX_TOOL_ITERATIONS` | `8` | LLM↔tool steps per user turn |
 | `MAX_HISTORY_MESSAGES` | `40` | Chat history sent to the LLM |
 | `ELEVENLABS_API_KEY` | — | Voice mode credentials |
@@ -107,19 +110,21 @@ and has a seedable random "kitchen busy" rate.
 | `VOICE_END_SILENCE_MS` | `900` | Pause that ends your turn |
 | `VOICE_VAD_MARGIN_DB` | `12` | How much louder than the room counts as speech (raise in noisy rooms) |
 | `VOICE_MAX_UTTERANCE_S` | `30` | Longest turn kept |
-| `LOG_LEVEL`, `LOG_DIR`, `LOG_TO_STDERR` | `INFO`, `logs`, `false` | Observability |
+| `LOG_LEVEL`, `LOG_DIR`, `LOG_TO_STDERR` | `INFO`, `logs`, `false` | Observability (`LOG_TO_STDERR` = `--verbose`) |
+
+</details>
 
 ---
 
-## How it works
+## High-level Design
 
-The LLM interprets the conversation; deterministic code owns the order. The model edits the cart
+The LLM interprets the conversation, while deterministic code owns the order. The model edits the cart
 only through typed tools that are validated against the menu, prices and the $50 limit are plain
 Python, and `submit_order` takes no arguments from the model, so it can only send the cart the
 customer has already reviewed and confirmed. MCP failures are classified (refused, server error,
 unreachable, uncertain, ...) and retried only when that is safe.
 
-For the details, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: module layout, the
+For more details, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: module layout, the
 failure-handling policy, prompt-injection defences, observability, cost, and what is enforced in
 code vs. left to the model.
 
@@ -127,33 +132,34 @@ code vs. left to the model.
 
 ## Quality gates
 
+The project uses [ruff](https://docs.astral.sh/ruff/) (formatting and linting), [ty](https://docs.astral.sh/ty/) (typechecking),
+[pytest](https://docs.pytest.org/en/stable/) (unit tests) and [uv](https://docs.astral.sh/uv/) (vulnerability scanning).
+
+Run the checks with:
+
 ```bash
-make check      # format, linting, typechecking, pytest
+make check      # format check, lint, typecheck, tests
 make fmt        # auto-format + autofix
 make audit      # scan locked dependencies for known vulnerabilities (needs network)
 make test-live  # tests marked `live`: real LLM / MCP / ElevenLabs (spends credits)
 ```
 
-Linting is **ruff** with a broad rule set (see `pyproject.toml`), type-checking is **ty**, and the
-**pytest** suite is offline and deterministic (about 1 s). Dependencies are audited with
-**uv audit** against OSV; accepted findings go in `[tool.uv.audit]`. GitHub Actions runs the same
-gates on every push and PR (once with all extras, once without, to keep voice optional), plus a
-weekly audit.
-
 ---
 
 ## Future steps
+
+Below is a non-exhaustive list of potential improvements to the agent:
 
 - **Voice, full duplex**: let the customer interrupt the agent (barge-in, which needs echo
   cancellation instead of muting the mic), stream the LLM reply into TTS sentence by sentence,
   and swap the energy detector for a model-based VAD (e.g. Silero) or realtime STT with
   server-side turn detection if noisy rooms turn out to matter.
+- **Voice**: Expose the agent over a network transport (WebSocket/WebRTC) so voice isn’t tied
+  to the local REPL’s Channel
 - **Evals**: scripted multi-turn scenarios run against the real LLM and the mock server. The
   assertions are deterministic: the final submitted payload, no submission without confirmation,
   the right clarifying questions. The report covers pass rate, tokens, cost and p50/p95 latency per
   model, so model choice is a measured decision. Possibly an LLM-as-judge for tone.
-- **Prod MCP contract tests**: a `@pytest.mark.live` suite against the provided server, checking
-  the [outcome classification table](docs/ARCHITECTURE.md#4-failure-handling-classify-the-outcome-then-decide) (including whether refusals expose a machine-readable code).
 - Extension to provide additional model providers.
 - Interactive mode for text agent / streaming replies.
 - OTel / Langfuse export of the traces, plus dashboards for latency, cost per order and guard activations.

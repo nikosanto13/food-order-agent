@@ -1,5 +1,9 @@
 # Architecture & Design Decisions
 
+> [!NOTE]
+> This document is mostly written by Claude Opus 5.5 (Medium) in Claude Code.
+
+
 How the Food Order Agent is put together and why. For setup and usage, see the
 [README](../README.md).
 

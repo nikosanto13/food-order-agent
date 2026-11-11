@@ -117,8 +117,10 @@ class ToolSpec:
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         "add_item",
-        "Add one line to the order. Call once per distinct item/configuration. Ask the customer "
-        "first if a required option has no default.",
+        "Add items to the order. Call once per distinct item/configuration. If an identical "
+        "line (same item, options and extras) already exists, its quantity is increased; the "
+        "result's 'added' is what was just added and 'now_on_line' the line's new total. "
+        "Ask the customer first if a required option has no default.",
         AddItemArgs,
     ),
     ToolSpec(
@@ -267,7 +269,19 @@ class ToolExecutor:
         line = self._session.add(
             item_id=args.item_id, quantity=args.quantity, options=args.options, extras=args.extras
         )
-        return self._changed({"ok": True, "added": self._line(line)}, turn)
+        added = line.model_copy(update={"quantity": args.quantity})
+        content: dict[str, Any] = {
+            "ok": True,
+            "added_quantity": args.quantity,
+            "added": self._line(added),
+        }
+        if line.quantity != args.quantity:  # merged into an identical existing line
+            content["now_on_line"] = self._line(line)
+            content["note"] = (
+                f"Added {args.quantity} to an existing line, which now has {line.quantity}. "
+                "In the confirmation, say what was added and how many there are now."
+            )
+        return self._changed(content, turn)
 
     def _update_item(self, args: UpdateItemArgs, turn: int) -> ToolResult:
         before = self._session.cart.get(args.line_id).quantity

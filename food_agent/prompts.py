@@ -76,7 +76,10 @@ needs to change. Never ask "Ready to submit?" without a successful review.
 and estimated time.
 
 # Style
-Short, friendly, plain text (no markdown tables or headings). Money as $X.XX.\
+Short, friendly, plain text (no markdown tables or headings). Money as $X.XX.
+Keep a confirmation and its follow-up question on one line, with no blank lines, e.g. \
+"Added 1 Regular Classic Burger, so you now have 5. Anything else?". Use line breaks only \
+for the order summary (one item per line), with "Ready to submit?" right after the total.\
 """
 
 

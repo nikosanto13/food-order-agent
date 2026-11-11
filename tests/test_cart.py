@@ -3,6 +3,7 @@ from decimal import Decimal
 import pytest
 
 from food_agent.cart import (
+    MAX_LINE_QUANTITY,
     Cart,
     OrderError,
     OrderPhase,
@@ -268,4 +269,40 @@ def test_invalid_split_leaves_the_cart_untouched(menu, kwargs, message):
     with pytest.raises(OrderError, match=message):
         cart.update(line.line_id, **kwargs)
     assert cart.lines == [line]
-    assert cart.add("fries").line_id == line.line_id + 1  # no line id was consumed
+    assert cart.add("classic_burger").line_id == line.line_id + 1  # no line id was consumed
+
+
+def test_adding_an_identical_item_merges_into_the_existing_line(menu):
+    # Regression: "5 burgers" -> "remove one" -> "add one" must give 5x, not 4x + 1x.
+    cart = Cart(menu)
+    line = cart.add("classic_burger", quantity=5)
+    cart.remove(line.line_id, quantity=1)
+    merged = cart.add("classic_burger")
+    assert merged.line_id == line.line_id
+    assert merged.quantity == 5
+    assert len(cart.lines) == 1
+
+
+def test_merge_ignores_extras_order_and_resolved_defaults(menu):
+    cart = Cart(menu)
+    a = cart.add("classic_burger", extras=["cheese", "bacon"])
+    b = cart.add("Classic Burger", options={"size": "regular"}, extras=["bacon", "cheese"])
+    assert b.line_id == a.line_id
+    assert b.quantity == 2
+    assert len(cart.lines) == 1
+
+
+def test_different_configuration_is_a_new_line(menu):
+    cart = Cart(menu)
+    a = cart.add("classic_burger")
+    b = cart.add("classic_burger", options={"size": "large"})
+    c = cart.add("classic_burger", extras=["cheese"])
+    assert len({a.line_id, b.line_id, c.line_id}) == 3
+
+
+def test_merge_respects_max_line_quantity(menu):
+    cart = Cart(menu)
+    line = cart.add("fries", quantity=MAX_LINE_QUANTITY)
+    with pytest.raises(OrderError, match="maximum"):
+        cart.add("fries")
+    assert cart.lines == [line]

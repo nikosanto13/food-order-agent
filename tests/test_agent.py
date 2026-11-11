@@ -387,6 +387,28 @@ def test_remove_one_of_several_units_keeps_the_rest(settings):
     assert agent.session.cart.snapshot()["total"] == "$47.50"
 
 
+def test_adding_more_of_an_existing_line_reports_added_and_new_total(settings):
+    agent, llm = make_agent(
+        settings,
+        [
+            tools(call("add_item", {"item_id": "classic_burger", "quantity": 5})),
+            say("Added 5x Regular Classic Burger."),
+            tools(call("remove_item", {"line_id": 1, "quantity": 1})),
+            say("Removed one. Now 4x."),
+            tools(call("add_item", {"item_id": "classic_burger"})),
+            say("Added one more Regular Classic Burger, so you now have 5."),
+        ],
+    )
+    agent.send("i want 5 burgers")
+    agent.send("remove one")
+    agent.send("add one")
+
+    result = llm.last_tool_result()
+    assert result["added"]["description"] == "Regular Classic Burger"
+    assert result["now_on_line"]["description"] == "5x Regular Classic Burger"
+    assert len(agent.session.cart.lines) == 1
+
+
 def test_change_during_checkout_re_reviews_so_yes_submits(settings):
     """After an over-limit review, fixing the cart re-reviews it; the next 'yes' submits."""
     submitter = CannedSubmitter()

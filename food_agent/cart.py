@@ -247,6 +247,12 @@ class Cart:
         options: Mapping[str, str] | None = None,
         extras: Sequence[str] | None = None,
     ) -> LineItem:
+        """Add units to the order.
+
+        If a line with the same item, options and extras already exists, its
+        quantity is increased instead of creating a duplicate line, so "add one
+        more" after "remove one" yields ``5x`` rather than ``4x`` + ``1x``.
+        """
         line = build_line(
             self._menu,
             line_id=self._next_id,
@@ -255,9 +261,31 @@ class Cart:
             options=options,
             extras=extras,
         )
+        existing = self._find_same_config(line)
+        if existing is not None:
+            new_quantity = existing.quantity + line.quantity
+            if new_quantity > MAX_LINE_QUANTITY:
+                raise OrderError(
+                    f"Line {existing.line_id} already has {existing.quantity}; adding "
+                    f"{line.quantity} would exceed the maximum of {MAX_LINE_QUANTITY} per line."
+                )
+            merged = existing.model_copy(update={"quantity": new_quantity})
+            self._lines[existing.line_id] = merged
+            return merged
         self._lines[line.line_id] = line
         self._next_id += 1
         return line
+
+    def _find_same_config(self, line: LineItem) -> LineItem | None:
+        """An existing line identical to ``line`` except for quantity (extras order ignored)."""
+        for existing in self._lines.values():
+            if (
+                existing.item_id == line.item_id
+                and existing.options == line.options
+                and set(existing.extras) == set(line.extras)
+            ):
+                return existing
+        return None
 
     def update(
         self,

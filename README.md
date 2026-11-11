@@ -116,20 +116,6 @@ Set any of these in `.env`:
 
 ---
 
-## High-level Design
-
-The LLM interprets the conversation, while deterministic code owns the order. The model edits the cart
-only through typed tools that are validated against the menu, prices and the $50 limit are plain
-Python, and `submit_order` takes no arguments from the model, so it can only send the cart the
-customer has already reviewed and confirmed. MCP failures are classified (refused, server error,
-unreachable, uncertain, ...) and retried only when that is safe.
-
-For more details, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: module layout, the
-failure-handling policy, prompt-injection defences, observability, cost, and what is enforced in
-code vs. left to the model.
-
----
-
 ## Quality gates
 
 The project uses [ruff](https://docs.astral.sh/ruff/) (formatting and linting), [ty](https://docs.astral.sh/ty/) (typechecking),
@@ -146,6 +132,39 @@ make test-live  # tests marked `live`: real LLM / MCP / ElevenLabs (spends credi
 
 ---
 
+## High-level Design
+
+- **The LLM interprets language, code validates.** The model handles language only. Code handles internal
+  cart state and the model changes the cart only through typed tools validated against the
+  menu, so it can't produce an invalid order ([§1](docs/ARCHITECTURE.md#1-the-llm-interprets-deterministic-code-decides)).
+- **Least-privilege submission.** `submit_order` takes no arguments from the model. The payload is
+  built from the cart, and code allows it only after the customer has reviewed that exact cart in an
+  earlier turn ([§2](docs/ARCHITECTURE.md#2-least-privilege-submission), [§3](docs/ARCHITECTURE.md#3-server-side-validation-before-submission)).
+- **Failures are classified before they're retried.** Each MCP response maps to one outcome
+  (refused, server error, unreachable, uncertain). Only safe outcomes are retried, and a
+  timeout after sending is never retried, to avoid double orders
+  ([§4](docs/ARCHITECTURE.md#4-failure-handling-classify-the-outcome-then-decide)).
+- **Grounded replies.** The live cart is injected into every LLM call, and reply guards append the
+  exact total or order id if the model leaves them out
+  ([§5](docs/ARCHITECTURE.md#5-conversation-quality)).
+- **User text is untrusted.** It never enters instructions, and even a successful prompt injection
+  can only call cart tools whose arguments are still validated
+  ([§6](docs/ARCHITECTURE.md#6-treating-user-text-as-untrusted)).
+- **Observable and cheap.** One trace record per turn (steps, tokens, latency, cost), a small model
+  by default and a cache-friendly prompt layout
+  ([§7](docs/ARCHITECTURE.md#7-observability), [§8](docs/ARCHITECTURE.md#8-performance--cost)).
+- **Voice is just another channel.** Hands-free voice reuses the same agent, so every guarantee
+  above still holds. Turns are detected locally by a simple energy-based endpointer (no model, no
+  push-to-talk), and the loop is half-duplex by design: the mic is muted while the agent speaks,
+  so it never hears itself, at the cost of no barge-in
+  ([§11](docs/ARCHITECTURE.md#11-voice-an-optional-front-end)).
+
+For more details, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: module layout, the
+failure-handling policy, observability, cost, and what is enforced in code vs. left to the model.
+
+---
+
+
 ## Future steps
 
 Below is a non-exhaustive list of potential improvements to the agent:
@@ -156,6 +175,11 @@ Below is a non-exhaustive list of potential improvements to the agent:
   server-side turn detection if noisy rooms turn out to matter.
 - **Voice**: Expose the agent over a network transport (WebSocket/WebRTC) so voice isn’t tied
   to the local REPL’s Channel
+- **HTTP API**: Serve the agent over HTTP (e.g. FastAPI) so other clients can place orders. This
+  needs substantial reworking: the agent currently keeps the cart and history in-process, one
+  conversation per instance, and `send()` is synchronous. It would need persisted sessions
+  keyed by conversation id, an async turn loop, and a guard against concurrent turns on the
+  same conversation.
 - **Evals**: scripted multi-turn scenarios run against the real LLM and the mock server. The
   assertions are deterministic: the final submitted payload, no submission without confirmation,
   the right clarifying questions. The report covers pass rate, tokens, cost and p50/p95 latency per

@@ -7,4 +7,6 @@ __pycache__/
 .coverage
 htmlcov/
 logs/
-evals/results/
+
+# local, untracked helper scripts
+scripts/

@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -67,7 +67,6 @@ class SubmitResult:
     outcome: SubmitOutcome
     result: dict[str, Any]  # what the server said (or a synthesized error body)
     attempts: int = 1
-    attempt_log: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -98,7 +97,8 @@ def _text_of(result: CallToolResult) -> str:
 
 def classify(result: CallToolResult) -> tuple[SubmitOutcome, dict[str, Any]]:
     body = _body_of(result)
-    if result.is_error:  # check isError *before* trusting structured content
+    # check isError *before* trusting structured content
+    if result.is_error:
         if body is not None and body.get("success") is False:
             return SubmitOutcome.SERVER_ERROR, body
         return SubmitOutcome.INVALID_REQUEST, {"success": False, "error": _text_of(result)}
@@ -109,6 +109,11 @@ def classify(result: CallToolResult) -> tuple[SubmitOutcome, dict[str, Any]]:
         }
     if body["success"] is True:
         return SubmitOutcome.SUCCESS, body
+
+    # NOTE: According to brief, this could occur both for kitchen_busy
+    # error (retryable) and a business refusal error (non retryable).
+    # However, the latter cannot occur due to validation in the
+    # OrderSession. We therefore assume that this state is always retryable.
     return SubmitOutcome.REFUSED, body
 
 
@@ -174,15 +179,12 @@ class McpOrderSubmitter:
             return outcome, {"success": False, "error": desc}
 
     def submit(self, payload: dict[str, Any]) -> SubmitResult:
-        attempts: list[dict[str, Any]] = []
+        attempt = 0
         outcome, body = SubmitOutcome.UNREACHABLE, {}
         for attempt in range(1, self._max_attempts + 1):
             started = time.perf_counter()
             outcome, body = anyio.run(self.asubmit_once, payload)
             latency_ms = round((time.perf_counter() - started) * 1000, 1)
-            attempts.append(
-                {"attempt": attempt, "outcome": outcome.value, "latency_ms": latency_ms}
-            )
             logger.info(
                 "mcp.submit_attempt",
                 attempt=attempt,
@@ -195,6 +197,4 @@ class McpOrderSubmitter:
                 break
             # Exponential backoff with full jitter.
             time.sleep(random.uniform(0, self._backoff_s * 2 ** (attempt - 1)))  # noqa: S311
-        return SubmitResult(
-            outcome=outcome, result=body, attempts=len(attempts), attempt_log=attempts
-        )
+        return SubmitResult(outcome=outcome, result=body, attempts=attempt)

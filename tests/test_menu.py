@@ -26,7 +26,9 @@ def test_loads_shipped_menu():
 def test_milkshake_flavor_has_no_default():
     shake = load_menu().get("milkshake")
     assert shake is not None
-    assert shake.required_without_default() == ["flavor"]
+    flavor = shake.options["flavor"]
+    assert flavor.required
+    assert flavor.default is None
 
 
 def test_prompt_rendering_flags_options_that_must_be_asked():

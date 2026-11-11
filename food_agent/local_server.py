@@ -1,4 +1,4 @@
-"""Run the mock MCP server in a background thread (for ``main.py --local`` and evals)."""
+"""Run the mock MCP server in a background thread (for ``main.py --local``)."""
 
 from __future__ import annotations
 

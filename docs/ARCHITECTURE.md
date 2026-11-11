@@ -73,13 +73,10 @@ and the model either corrects itself or asks the customer. It can never produce 
   review. Together these guarantee the customer saw exactly this cart and total and replied to it
   before anything left the process. The model still decides whether the reply means "yes"; it just
   can't skip showing the summary first.
-- The model never sees the MCP client, URL or headers. Its whole capability is the eight cart tools.
 
 ### 3. Server-side validation before submission
 `validate_for_submission()` re-validates every line from scratch and checks the $50 limit when the
-order is reviewed *and again* right before it is sent. The customer hears about an over-limit
-order, with the amount it is over by, during review, not as a remote refusal after they have
-already said yes.
+order is reviewed *and again* right before it is sent.
 
 ### 4. Failure handling: classify the outcome, then decide
 Every MCP response maps to exactly one outcome. The retry policy is keyed on the outcome, never on

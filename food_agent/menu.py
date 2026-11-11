@@ -76,10 +76,6 @@ class MenuItem(_Frozen):
     def extra_prices(self) -> dict[str, Decimal]:
         return {e.id: e.price for e in self.extras.choices} if self.extras else {}
 
-    def required_without_default(self) -> list[str]:
-        """Options the customer *must* choose explicitly (e.g. milkshake flavor)."""
-        return [n for n, o in self.options.items() if o.required and o.default is None]
-
 
 class Menu(_Frozen):
     items: tuple[MenuItem, ...] = Field(alias="menu", min_length=1)

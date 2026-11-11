@@ -28,7 +28,6 @@ voice = [
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
-    "pytest-cov>=7.1.0",
     "ruff>=0.17.4",
     "ty>=0.0.99",
 ]
@@ -74,7 +73,6 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "PLR2004", "ANN", "S106"]
-"evals/**" = ["T20", "PLR2004"]
 "main.py" = ["T20"]
 
 # ---------------------------------------------------------------- ty
@@ -82,7 +80,7 @@ ignore = [
 python-version = "3.13"
 
 [tool.ty.src]
-include = ["food_agent", "tests", "evals", "agent.py", "main.py"]
+include = ["food_agent", "tests", "agent.py", "main.py"]
 
 [tool.ty.rules]
 possibly-unresolved-reference = "error"
